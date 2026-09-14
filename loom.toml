@@ -1,0 +1,47 @@
+# Loom configuration. Parsed once at startup; a malformed entry stops the program.
+
+timezone = "America/Los_Angeles"
+data_root = "data"
+horizon_days = 14
+
+[scheduler]
+min_chunk_minutes = 25
+max_chunk_minutes = 90
+stale_grace_minutes = 30
+
+[web]
+port = 8321
+day_start = "02:00"     # top edge of the calendar grid
+day_end = "01:00"       # bottom edge; at or before day_start means it runs past midnight
+scroll_start = "08:00"  # where the grid is scrolled to on page load
+
+# Windows are local wall-clock in the timezone above. Days: Mon Tue Wed Thu Fri Sat Sun,
+# single day ("Sat") or inclusive range ("Mon-Fri").
+[areas.work]
+windows = ["Mon-Fri 10:00-17:00"]
+color = "#58a6ff"
+
+[areas.personal]
+windows = ["Mon-Fri 12:30-13:30", "Mon-Fri 17:00-23:59", "Sat 09:00-23:59", "Sun 09:00-23:59"]
+color = "#3fb950"
+
+# Sample data lives here; the real areas stay clean.
+[areas.demo]
+windows = ["Mon-Sun 09:00-21:00"]
+color = "#8957e5"
+
+# Named color presets a task can be set to directly (task edit panel, "color").
+# Renaming or recoloring a preset here recolors every task pointing at it.
+[palette]
+"Personal/Chores" = "#9b5de5"
+Food = "#f5921e"
+Relaxation = "#4caf50"
+Socialization = "#45b8e8"
+Projects = "#335c67"
+Urgent = "#eceff1"
+Health = "#5c8001"
+
+# Calendar block colors by task title: case-insensitive substring match,
+# first match in file order wins, no match falls back to the area color.
+# A task's manual palette color, when set, wins over these keywords.
+[colors]

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./data/work/**)",
+      "Read(./data/personal/**)",
+      "Edit(./data/work/**)",
+      "Edit(./data/personal/**)"
+    ]
+  }
+}

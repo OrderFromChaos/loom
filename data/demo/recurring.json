@@ -1,0 +1,49 @@
+{
+  "format": 1,
+  "recurring": {
+    "r_jnzmp5wp": {
+      "title": "Take out the trash",
+      "notes": "",
+      "estimate_minutes": 10,
+      "auto_schedule": true,
+      "priority": "medium",
+      "goal": "g_lifeadmin",
+      "days": [
+        "Mon"
+      ],
+      "every_days": null,
+      "deadline_after_days": 2,
+      "created": "2026-09-14T02:26:21.892077+00:00",
+      "last_added": "2026-09-14T16:31:45.095379+00:00"
+    },
+    "r_cjtb5ww4": {
+      "title": "Water the plants",
+      "notes": "",
+      "estimate_minutes": 5,
+      "auto_schedule": true,
+      "priority": "medium",
+      "goal": null,
+      "days": [
+        "Tue",
+        "Sat"
+      ],
+      "every_days": null,
+      "deadline_after_days": 0,
+      "created": "2026-09-14T02:32:32.430841+00:00",
+      "last_added": null
+    },
+    "r_st4o2wut": {
+      "title": "Shave",
+      "notes": "",
+      "estimate_minutes": 15,
+      "auto_schedule": true,
+      "priority": "medium",
+      "goal": null,
+      "days": [],
+      "every_days": 14,
+      "deadline_after_days": null,
+      "created": "2026-09-14T03:11:22.442540+00:00",
+      "last_added": "2026-09-14T03:11:22.451772+00:00"
+    }
+  }
+}

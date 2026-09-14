@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "goals": {
+    "g_shipdemo": {
+      "title": "Ship the Q4 demo",
+      "notes": "",
+      "created": "2026-09-13T17:00:00+00:00"
+    },
+    "g_lifeadmin": {
+      "title": "Life admin stays current",
+      "notes": "",
+      "created": "2026-09-01T02:11:00+00:00",
+      "completed": null
+    },
+    "g_ig4zgucm": {
+      "title": "Get strong",
+      "notes": "3x per week",
+      "created": "2026-09-14T01:25:13.176670+00:00",
+      "completed": null
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "loom",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "loom", "serve", "--area", "demo"],
+      "port": 8321
+    }
+  ]
+}
