@@ -1,7 +1,6 @@
 """Render the deadline page: every open deadline in one place, off the calendar.
 
-The main calendar never shows deadline pressure; this page shows all of it, including
-tasks the scheduler could not fit before their date.
+The page includes the tasks the plan could not fit before their date.
 """
 
 from __future__ import annotations
@@ -9,8 +8,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from loom.vocabulary import Area, DeadlineEntry, Plan, Reason, Task, TaskId
-from loom.web.page_shell import esc, renderPage
+from loom.web import page_shell
 from loom.web.web_vocabulary import View
+
+
+_SOON_DAYS = 3  # a deadline this many days out or fewer is highlighted
 
 
 def renderDeadlinesPage(
@@ -20,11 +22,11 @@ def renderDeadlinesPage(
     plan: Plan | None,
     tasks: Mapping[TaskId, Task],
 ) -> str:
-    """The whole deadlines page: the table, then any deadline the plan cannot meet."""
+    """Render the deadlines page: the table, then any deadline the plan cannot meet."""
     if not entries:
         table = '<p class="empty">no open deadlines</p>'
     else:
-        rows = '\n'.join(_renderRow(area, entry) for entry in entries)
+        rows = '\n'.join(_renderDeadlineRow(area, entry) for entry in entries)
         table = (
             '<table class="deadlines"><thead><tr>'
             '<th>days left</th><th>task</th><th>goal</th><th>priority</th><th>planned</th>'
@@ -35,7 +37,8 @@ def renderDeadlinesPage(
     banner = ''
     if missed:
         items = '\n'.join(
-            f'<li><a href="/{area}/tasks?focus={entry.task}">{esc(_titleOf(entry.task, tasks))}</a></li>'
+            f'<li><a href="/{area}/tasks?focus={entry.task}">'
+            f'{page_shell.escapeHtml(page_shell.findTaskTitle(entry.task, tasks))}</a></li>'
             for entry in missed
         )
         banner = (
@@ -43,18 +46,19 @@ def renderDeadlinesPage(
             f'<ul>{items}</ul></div>'
         )
 
-    return renderPage('deadlines', area, View.DEADLINES, f'<h2>Deadlines</h2>{banner}{table}')
+    return page_shell.renderPage('deadlines', area, View.DEADLINES, f'<h2>Deadlines</h2>{banner}{table}')
 
 
-def _renderRow(area: Area, entry: DeadlineEntry) -> str:
+def _renderDeadlineRow(area: Area, entry: DeadlineEntry) -> str:
+    """Render one table row: days left, task, goal, priority and planned minutes."""
     if entry.days_remaining < 0:
         days_class, days_text = 'days overdue', f'{-entry.days_remaining}d overdue'
-    elif entry.days_remaining <= 3:
+    elif entry.days_remaining <= _SOON_DAYS:
         days_class, days_text = 'days soon', f'{entry.days_remaining}d'
     else:
         days_class, days_text = 'days', f'{entry.days_remaining}d'
 
-    goal_text = esc(entry.goal.title) if entry.goal is not None else '&mdash;'
+    goal_text = page_shell.escapeHtml(entry.goal.title) if entry.goal is not None else '&mdash;'
     blocked = ' <span class="badge dep-blocked">dep-blocked</span>' if entry.dependency_blocked else ''
     if entry.task.estimate_minutes is not None:
         planned = f'{entry.minutes_planned}/{entry.task.estimate_minutes}m'
@@ -63,11 +67,6 @@ def _renderRow(area: Area, entry: DeadlineEntry) -> str:
 
     return (
         f'<tr><td class="{days_class}">{days_text}</td>'
-        f'<td><a href="/{area}/tasks?focus={entry.task.id}">{esc(entry.task.title)}</a>{blocked}</td>'
+        f'<td><a href="/{area}/tasks?focus={entry.task.id}">{page_shell.escapeHtml(entry.task.title)}</a>{blocked}</td>'
         f'<td>{goal_text}</td><td>{entry.task.priority.value}</td><td>{planned}</td></tr>'
     )
-
-
-def _titleOf(task_id: TaskId, tasks: Mapping[TaskId, Task]) -> str:
-    task = tasks.get(task_id)
-    return task.title if task is not None else f'missing task {task_id}'

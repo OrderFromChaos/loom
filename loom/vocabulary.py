@@ -1,8 +1,9 @@
 """Every type that crosses a module boundary in loom.
 
-Identifiers are short random slugs: a TaskId is 't_' plus 8 base32 characters, a GoalId
-'g_...', an EventId 'e_...'. Every datetime is timezone-aware and stored in UTC. Dates,
-WeeklyWindow times and WebConfig times are local wall-clock in the configured timezone.
+An identifier is a prefix and 8 random base32 characters: 't_' for a TaskId, 'g_' for a
+GoalId, 'e_' for an EventId, 'r_' for a RecurringId and 's_' for a StepId. Every datetime
+is timezone-aware and stored in UTC. Dates, WeeklyWindow times and WebConfig times are
+local wall-clock in the configured timezone.
 """
 
 from __future__ import annotations
@@ -23,9 +24,11 @@ EventId = NewType('EventId', str)
 RecurringId = NewType('RecurringId', str)
 StepId = NewType('StepId', str)
 Color = NewType('Color', str)
-Area = NewType('Area', str)  # a data area name; the [areas.*] tables in loom.toml define the set
+Area = NewType('Area', str)  # a data area name. The [areas.*] tables of loom.toml define the set
 
 DAY_NAMES = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')  # index = datetime.weekday()
+MINUTES_PER_HOUR = 60
+MINUTES_PER_DAY = 24 * MINUTES_PER_HOUR
 
 
 class Status(Enum):
@@ -41,7 +44,7 @@ class Priority(Enum):
     MEDIUM = 'medium'
     LOW = 'low'
 
-    def rank(self) -> int:
+    def computeSortRank(self) -> int:
         """Sort position: HIGH sorts first."""
         match self:
             case Priority.HIGH:
@@ -81,7 +84,7 @@ class Goal:
     notes: str
     created: datetime
     completed: datetime | None
-    position: int | None = None  # 1-based display order; None sorts after every positioned goal
+    position: int | None = None  # 1-based display order. None sorts after every positioned goal
 
 
 @dataclass(frozen=True)
@@ -90,23 +93,27 @@ class Task:
     title: str
     status: Status
     parent: TaskId | None
-    goal: GoalId | None  # set on root tasks only; descendants inherit via graph.py
+    goal: GoalId | None  # set on root tasks only. A descendant inherits the goal of its root
     blocked_by: tuple[TaskId, ...]
     notes: str
-    estimate_minutes: int | None  # None = unestimated; the scheduler reports, never guesses
+    estimate_minutes: int | None  # None means unestimated. Such a task stays unplaced, with no guessed estimate
     deadline: date | None  # local calendar day, due at its end
     auto_schedule: bool
     priority: Priority
     created: datetime
     completed: datetime | None
     origin: RecurringId | None = None  # the template this task was spawned from
-    color: str | None = None  # palette preset NAME; None falls back to keyword then area color
-    not_before: datetime | None = None  # the scheduler places nothing earlier, e.g. when an office opens
+    color: str | None = None  # palette preset NAME. None falls back to the category rules, then the area color
+    not_before: datetime | None = None  # no block of this task starts earlier, e.g. before an office opens
+
+
+# the children of each task. The None key groups the root tasks
+ChildIndex = dict[TaskId | None, tuple[Task, ...]]
 
 
 @dataclass(frozen=True)
 class Preferences:
-    order: TaskOrder  # how the scheduler orders auto tasks, and how the Auto group lists them
+    order: TaskOrder  # the order of auto tasks in the plan and in the Auto group
 
 
 @dataclass(frozen=True)
@@ -117,25 +124,29 @@ class RecurringTask:
     estimate_minutes: int | None
     auto_schedule: bool
     priority: Priority
-    goal: GoalId | None  # where a spawned copy lands
-    days: frozenset[int]  # anchored weekday numbers, Monday = 0; empty in interval mode
-    every_days: int | None  # interval mode: days since the last completed copy; None in anchored mode
-    deadline_after_days: int | None  # copy's deadline = its occurrence date + this; None = no deadline
+    goal: GoalId | None  # the goal of each spawned copy
+    days: frozenset[int]  # anchored weekday numbers, Monday = 0. Empty in interval mode
+    every_days: int | None  # interval mode: days between occurrences. None in anchored mode
+    deadline_after_days: int | None  # a copy's deadline is its occurrence date plus this. None: no deadline
     wait_for_completion: bool  # True: one open copy at most, and an interval restarts at completion
     created: datetime
     last_added: datetime | None  # spawn cursor: the clock the next occurrence counts from
-    next_due: date | None = None  # interval only: a hand-set next occurrence; cleared once it spawns
+    next_due: date | None = None  # interval only: a hand-set next occurrence, cleared once it spawns
 
 
 @dataclass(frozen=True)
 class RecurringStep:
     id: StepId
     template: RecurringId  # the template this step belongs to
-    parent: StepId | None  # None: directly under the template; steps nest without limit
+    parent: StepId | None  # None: directly under the template. Steps nest to any depth
     title: str
     estimate_minutes: int | None
     auto_schedule: bool
     created: datetime  # sibling order, oldest first
+
+
+# one template's steps under each parent step. The None key groups the top level
+StepIndex = dict[StepId | None, tuple[RecurringStep, ...]]
 
 
 @dataclass(frozen=True)
@@ -200,15 +211,15 @@ class Placement:
 
 @dataclass(frozen=True)
 class TasksByBucket:
-    """The standard ADHD ordering: four buckets, listed and placed top to bottom."""
+    """The four buckets of the standard ADHD ordering, listed and placed top to bottom."""
 
     at_risk: tuple[Task, ...]  # deadline at risk, soonest deadline first
     quickest: tuple[Task, ...]  # doable now, fewest estimated minutes first
     not_yet: tuple[Task, ...]  # not_before still ahead, soonest first
-    unestimated: tuple[Task, ...]  # no estimate: listed, never placed; input order kept
+    unestimated: tuple[Task, ...]  # no estimate: listed, never placed, in input order
 
-    def placementQueue(self) -> tuple[Task, ...]:
-        """Every placeable task in bucket order; the unestimated have nothing to place."""
+    def listPlacementQueue(self) -> tuple[Task, ...]:
+        """Every placeable task, in bucket order. The unestimated bucket is left out."""
         return (*self.at_risk, *self.quickest, *self.not_yet)
 
 
@@ -228,7 +239,7 @@ class WeeklyWindow:
 @dataclass(frozen=True)
 class CategoryRule:
     pattern: re.Pattern[str]  # searched against a task title, case-insensitive
-    category: str  # a palette preset name, which carries the color
+    category: str  # a palette preset name, the source of the color
 
 
 @dataclass(frozen=True)
@@ -242,15 +253,28 @@ class SchedulerConfig:
 class WebConfig:
     port: int
     day_start: time  # top edge of the calendar grid
-    day_end: time  # bottom edge; at or before day_start means it runs past midnight
+    day_end: time  # bottom edge. At or before day_start, the grid runs past midnight
     scroll_start: time  # where the grid is scrolled to on page load
+
+    def computeGridStartMinute(self) -> int:
+        return self.day_start.hour * MINUTES_PER_HOUR + self.day_start.minute
+
+    def computeGridEndMinute(self) -> int:
+        """Minutes from local midnight to the bottom edge, above MINUTES_PER_DAY when the grid runs past midnight."""
+        end = self.day_end.hour * MINUTES_PER_HOUR + self.day_end.minute
+        return end if end > self.computeGridStartMinute() else end + MINUTES_PER_DAY
+
+    def computeScrollMinute(self) -> int:
+        """Minutes from local midnight to scroll_start, above MINUTES_PER_DAY when it is after midnight."""
+        scroll = self.scroll_start.hour * MINUTES_PER_HOUR + self.scroll_start.minute
+        return scroll if scroll >= self.computeGridStartMinute() else scroll + MINUTES_PER_DAY
 
 
 @dataclass(frozen=True)
 class AreaConfig:
     windows: tuple[WeeklyWindow, ...]
     color: Color
-    finished: date | None  # the day it was finished: off the switcher, no longer planned; data kept
+    finished: date | None  # the day the area was finished: off the switcher and unplanned, with its data kept
     hidden: bool  # still planned, but off the switcher: reached from its + menu (the demo area)
 
 
@@ -263,13 +287,7 @@ class Config:
     web: WebConfig
     areas: Mapping[Area, AreaConfig]
     palette: Mapping[str, Color]  # the categories: named presets a task can point at
-    categories: tuple[CategoryRule, ...]  # automatic assignment; match order: first hit wins
-
-
-# a mapping stays a mapping: the None key groups the root tasks
-ChildIndex = dict[TaskId | None, tuple[Task, ...]]
-# one template's steps under their parent step; the None key groups the top level
-StepIndex = dict[StepId | None, tuple[RecurringStep, ...]]
+    categories: tuple[CategoryRule, ...]  # automatic assignment, in match order. The first match wins
 
 
 @dataclass(frozen=True)
@@ -278,11 +296,11 @@ class DeadlineEntry:
     goal: Goal | None
     days_remaining: int  # negative when overdue
     dependency_blocked: bool
-    minutes_planned: int  # minutes the current plan gives this task
+    minutes_planned: int  # minutes of this task in the current plan
 
 
 class ConfigError(RuntimeError):
-    """loom.toml is missing or malformed."""
+    """The loom.toml file is absent or malformed."""
 
 
 class StoreError(RuntimeError):
@@ -293,5 +311,5 @@ class StoreConflictError(StoreError):
     """The file changed on disk after this Store loaded it."""
 
 
-class IntegrityError(RuntimeError):
-    """Task references do not resolve: a dangling id or a parent cycle."""
+class TemplateNotFoundError(RuntimeError):
+    """No recurring template has the requested id."""

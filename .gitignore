@@ -10,3 +10,6 @@ __pycache__/
 # real areas stay local; only the demo area is committable
 data/*
 !data/demo/
+
+# per-user config; loom.example.toml is the tracked template
+loom.toml

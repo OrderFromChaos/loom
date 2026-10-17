@@ -1,8 +1,8 @@
 """Pure geometry for the week grid: minute spans to percent boxes and overlap columns.
 
-Everything works in minutes since local midnight, so a DST day changes nothing here;
-the caller converts wall-clock time to minutes per day. A span outside the visible
-window maps to None; a span crossing its edge is clipped.
+Every value is in minutes since local midnight, so a DST day changes nothing here. The
+caller converts wall-clock time to minutes per day. A span outside the visible window
+maps to None, and a span across its edge is clipped.
 """
 
 from __future__ import annotations
@@ -12,15 +12,15 @@ from collections.abc import Sequence
 from loom.web.web_vocabulary import BlockBox
 
 
-def layoutDay(
+def computeBlockBoxes(
     spans: Sequence[tuple[int, int]],
     day_start_minute: int,
     day_end_minute: int,
 ) -> tuple[BlockBox | None, ...]:
-    """One box per span, positionally: percent geometry plus overlap sub-columns.
+    """Compute one box per span, in span order: percent geometry plus overlap sub-columns.
 
-    Overlapping spans split their group's width into columns; a span alone keeps the
-    whole lane. Column assignment is by (start, end, position), so it is deterministic.
+    Overlapping spans split their group's width into columns, and a span alone gets the
+    whole lane. Columns are assigned in (start, end, position) order.
     """
     window = day_end_minute - day_start_minute
     clipped: list[tuple[int, int] | None] = []
@@ -50,10 +50,10 @@ def layoutDay(
 
 
 def _assignColumns(spans: Sequence[tuple[int, int] | None]) -> list[tuple[int, int] | None]:
-    """Interval partitioning: per span, (column, group column count), None for a None span.
+    """Assign each span a (column, group column count) by interval partitioning, None for a None span.
 
-    A group is a maximal run of transitively overlapping spans; every member reports the
-    same column count, so their widths line up.
+    A group is a maximal run of transitively overlapping spans. Every member gets the same
+    column count, so their widths line up.
     """
     ordered = sorted((span, index) for index, span in enumerate(spans) if span is not None)
 
