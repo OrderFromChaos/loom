@@ -1,6 +1,6 @@
 """Read and write one area's data files.
 
-A Store owns one area directory (data/work or data/personal) holding:
+A Store owns one area directory (data/<area name>) holding:
 
     goals.json          id-keyed goals
     tasks.json          id-keyed tasks
@@ -8,13 +8,20 @@ A Store owns one area directory (data/work or data/personal) holding:
     plan.json           the current schedule, rewritten by every planner run
     plan_history.jsonl  append-only: blocks retired as their time passes
     events.jsonl        append-only: logged reality and stale acknowledgements
+    recurring.json      id-keyed recurring templates
+    recurring_steps.json  id-keyed steps: each names its template and parent step, and
+                        every spawned copy gets the tree as nested subtasks
+    preferences.json    per-area choices, e.g. {"format": 1, "order": "shortest-first"}
 
 One tasks.json record:
 
     "t_9m2xw4ab": {"title": "Get passport photo taken", "status": "todo",
                    "parent": "t_7f3kq2vd", "goal": null, "blocked_by": [], "notes": "",
                    "estimate_minutes": 30, "deadline": null, "auto_schedule": true,
-                   "priority": "high", "created": "2026-09-13T17:21:00+00:00", "completed": null}
+                   "priority": "high", "created": "2026-09-13T17:21:00+00:00", "completed": null,
+                   "not_before": "2026-09-14T16:00:00+00:00"}
+
+not_before, like every timestamp, is UTC; the scheduler places no block before it.
 
 One events.jsonl line of each shape:
 
@@ -53,15 +60,19 @@ from loom.vocabulary import (
     LoggedEvent,
     Plan,
     PlanBlock,
+    Preferences,
     Priority,
     Reason,
     RecurringId,
+    RecurringStep,
     RecurringTask,
     Status,
+    StepId,
     StoreConflictError,
     StoreError,
     Task,
     TaskId,
+    TaskOrder,
     Unplaced,
 )
 
@@ -69,10 +80,12 @@ from loom.vocabulary import (
 _GOALS_FILE = 'goals.json'
 _TASKS_FILE = 'tasks.json'
 _RECURRING_FILE = 'recurring.json'
+_STEPS_FILE = 'recurring_steps.json'
 _FIXED_FILE = 'fixed.json'
 _PLAN_FILE = 'plan.json'
 _HISTORY_FILE = 'plan_history.jsonl'
 _EVENTS_FILE = 'events.jsonl'
+_PREFERENCES_FILE = 'preferences.json'
 _FORMAT_VERSION = 1
 _ID_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567'
 _ID_LENGTH = 8
@@ -81,9 +94,11 @@ LOG = logging.getLogger('loom')
 
 _T = TypeVar('_T')
 
+DEFAULT_PREFERENCES = Preferences(order=TaskOrder.DEADLINE)
+
 
 def storeFor(area: Area) -> Store:
-    return Store(CONFIG.data_root / area.value)
+    return Store(CONFIG.data_root / area)
 
 
 def newTaskId() -> TaskId:
@@ -100,6 +115,10 @@ def newEventId() -> EventId:
 
 def newRecurringId() -> RecurringId:
     return RecurringId('r_' + _newSlug())
+
+
+def newStepId() -> StepId:
+    return StepId('s_' + _newSlug())
 
 
 def _newSlug() -> str:
@@ -190,6 +209,30 @@ class Store:
         }
         self._save(_RECURRING_FILE, json.dumps(payload, indent=2, ensure_ascii=False) + '\n')
 
+    def loadSteps(self) -> dict[StepId, RecurringStep]:
+        """Read recurring_steps.json, empty when the file does not exist yet.
+
+        Raises:
+            StoreError: the file is unreadable, not JSON, or a step is malformed.
+        """
+        raw = self._loadJson(_STEPS_FILE)
+        if raw is None:
+            return {}
+
+        path = self.directory / _STEPS_FILE
+        records = raw.get('steps')
+        if not isinstance(records, dict):
+            raise _reject(path, '"steps" must be an object of id-keyed steps')
+
+        return {StepId(key): _parseStep(StepId(key), value, path) for key, value in records.items()}
+
+    def saveSteps(self, steps: Mapping[StepId, RecurringStep]) -> None:
+        payload: dict[str, object] = {
+            'format': _FORMAT_VERSION,
+            'steps': {step_id: _stepToJson(step) for step_id, step in steps.items()},
+        }
+        self._save(_STEPS_FILE, json.dumps(payload, indent=2, ensure_ascii=False) + '\n')
+
     def loadFixed(self) -> tuple[FixedEvent, ...]:
         """Read fixed.json, empty when the file does not exist yet.
 
@@ -230,7 +273,16 @@ class Store:
         except ValueError as exc:
             raise _reject(path, str(exc)) from exc
 
-        return Plan(generated=generated, blocks=blocks, unplaced=unplaced)
+        raw_at_risk = raw.get('at_risk', [])
+        if not isinstance(raw_at_risk, list) or not all(isinstance(entry, str) for entry in raw_at_risk):
+            raise _reject(path, '"at_risk" must be a list of task ids')
+
+        return Plan(
+            generated=generated,
+            blocks=blocks,
+            unplaced=unplaced,
+            at_risk=tuple(TaskId(entry) for entry in raw_at_risk),
+        )
 
     def savePlan(self, plan: Plan) -> None:
         payload: dict[str, object] = {
@@ -238,8 +290,28 @@ class Store:
             'generated': plan.generated.isoformat(),
             'blocks': [_blockToJson(block) for block in plan.blocks],
             'unplaced': [{'task': entry.task, 'reason': entry.reason.value} for entry in plan.unplaced],
+            'at_risk': list(plan.at_risk),
         }
         self._save(_PLAN_FILE, json.dumps(payload, indent=2, ensure_ascii=False) + '\n')
+
+    def loadPreferences(self) -> Preferences:
+        """Read preferences.json; the defaults when the file does not exist yet.
+
+        Raises:
+            StoreError: the file is unreadable, not JSON, or a value is malformed.
+        """
+        raw = self._loadJson(_PREFERENCES_FILE)
+        if raw is None:
+            return DEFAULT_PREFERENCES
+
+        try:
+            return Preferences(order=TaskOrder(_string(raw, 'order')))
+        except ValueError as exc:
+            raise _reject(self.directory / _PREFERENCES_FILE, str(exc)) from exc
+
+    def savePreferences(self, preferences: Preferences) -> None:
+        payload: dict[str, object] = {'format': _FORMAT_VERSION, 'order': preferences.order.value}
+        self._save(_PREFERENCES_FILE, json.dumps(payload, indent=2, ensure_ascii=False) + '\n')
 
     def loadPlanHistory(self) -> tuple[PlanBlock, ...]:
         return self._loadJsonl(_HISTORY_FILE, _parseBlock)
@@ -404,6 +476,7 @@ def _parseTask(task_id: TaskId, raw: object, path: Path) -> Task:
             completed=_optionalTimestamp(raw, 'completed'),
             origin=RecurringId(origin) if origin is not None else None,
             color=_optionalString(raw, 'color'),
+            not_before=_optionalTimestamp(raw, 'not_before'),
         )
     except ValueError as exc:
         raise _reject(path, f'{task_id}: {exc}') from exc
@@ -429,6 +502,9 @@ def _parseRecurring(recurring_id: RecurringId, raw: object, path: Path) -> Recur
         every = _optionalPositiveInt(raw, 'every_days')
         if bool(day_numbers) == (every is not None):
             raise ValueError("exactly one of 'days' and 'every_days' must be set")
+        next_due = _optionalDate(raw, 'next_due')
+        if next_due is not None and every is None:
+            raise ValueError("'next_due' applies to 'every_days' templates only; anchor days set their own dates")
         return RecurringTask(
             id=recurring_id,
             title=_string(raw, 'title'),
@@ -440,11 +516,39 @@ def _parseRecurring(recurring_id: RecurringId, raw: object, path: Path) -> Recur
             days=day_numbers,
             every_days=every,
             deadline_after_days=deadline_after,
+            # records written before the toggle existed keep their old behaviour: an
+            # interval template waited for completion, an anchored one stacked copies
+            wait_for_completion=_optionalBool(raw, 'wait_for_completion', default=every is not None),
             created=_timestamp(raw, 'created'),
             last_added=_optionalTimestamp(raw, 'last_added'),
+            next_due=next_due,
         )
     except ValueError as exc:
         raise _reject(path, f'{recurring_id}: {exc}') from exc
+
+
+def _parseStep(step_id: StepId, raw: object, path: Path) -> RecurringStep:
+    """Construct a RecurringStep from one recurring_steps.json record.
+
+    Raises:
+        StoreError: a field is missing or malformed; the message names the step.
+    """
+    if not isinstance(raw, dict):
+        raise _reject(path, f'{step_id}: record must be an object')
+
+    try:
+        parent = _optionalString(raw, 'parent')
+        return RecurringStep(
+            id=step_id,
+            template=RecurringId(_string(raw, 'template')),
+            parent=StepId(parent) if parent is not None else None,
+            title=_string(raw, 'title'),
+            estimate_minutes=_optionalPositiveInt(raw, 'estimate_minutes'),
+            auto_schedule=_requireBool(raw, 'auto_schedule'),
+            created=_timestamp(raw, 'created'),
+        )
+    except ValueError as exc:
+        raise _reject(path, f'{step_id}: {exc}') from exc
 
 
 def _parseFixed(raw: object, path: Path) -> FixedEvent:
@@ -557,6 +661,7 @@ def _taskToJson(task: Task) -> dict[str, object]:
         'completed': task.completed.isoformat() if task.completed else None,
         'origin': task.origin,
         'color': task.color,
+        'not_before': task.not_before.isoformat() if task.not_before else None,
     }
 
 
@@ -571,8 +676,21 @@ def _recurringToJson(template: RecurringTask) -> dict[str, object]:
         'days': [DAY_NAMES[number] for number in sorted(template.days)],
         'every_days': template.every_days,
         'deadline_after_days': template.deadline_after_days,
+        'wait_for_completion': template.wait_for_completion,
         'created': template.created.isoformat(),
         'last_added': template.last_added.isoformat() if template.last_added else None,
+        'next_due': template.next_due.isoformat() if template.next_due else None,
+    }
+
+
+def _stepToJson(step: RecurringStep) -> dict[str, object]:
+    return {
+        'template': step.template,
+        'parent': step.parent,
+        'title': step.title,
+        'estimate_minutes': step.estimate_minutes,
+        'auto_schedule': step.auto_schedule,
+        'created': step.created.isoformat(),
     }
 
 
@@ -625,6 +743,13 @@ def _requireBool(record: Mapping[str, object], key: str) -> bool:
         raise ValueError(f'{key!r} must be true or false')
 
     return value
+
+
+def _optionalBool(record: Mapping[str, object], key: str, *, default: bool) -> bool:
+    if key not in record:
+        return default
+
+    return _requireBool(record, key)
 
 
 def _requirePositiveInt(record: Mapping[str, object], key: str) -> int:

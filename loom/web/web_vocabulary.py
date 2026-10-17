@@ -11,6 +11,7 @@ class View(Enum):
     TASKS = 'tasks'
     RECURRING = 'recurring'
     DEADLINES = 'deadlines'
+    ACHIEVEMENTS = 'achievements'
     SETTINGS = 'settings'
 
 

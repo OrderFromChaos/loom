@@ -25,6 +25,16 @@ from loom.vocabulary import (
 )
 
 
+def overdueTaskIds(tasks: Mapping[TaskId, Task], now: datetime) -> frozenset[TaskId]:
+    """Open tasks whose deadline day has ended: what the pages currently call stale."""
+    today = now.astimezone(CONFIG.timezone).date()
+    return frozenset(
+        task.id
+        for task in tasks.values()
+        if graph.stillOpen(task) and task.deadline is not None and task.deadline < today
+    )
+
+
 def staleTaskIds(
     tasks: Mapping[TaskId, Task],
     plan: Plan | None,

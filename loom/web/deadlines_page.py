@@ -35,7 +35,7 @@ def renderDeadlinesPage(
     banner = ''
     if missed:
         items = '\n'.join(
-            f'<li><a href="/{area.value}/tasks?focus={entry.task}">{esc(_titleOf(entry.task, tasks))}</a></li>'
+            f'<li><a href="/{area}/tasks?focus={entry.task}">{esc(_titleOf(entry.task, tasks))}</a></li>'
             for entry in missed
         )
         banner = (
@@ -63,7 +63,7 @@ def _renderRow(area: Area, entry: DeadlineEntry) -> str:
 
     return (
         f'<tr><td class="{days_class}">{days_text}</td>'
-        f'<td><a href="/{area.value}/tasks?focus={entry.task.id}">{esc(entry.task.title)}</a>{blocked}</td>'
+        f'<td><a href="/{area}/tasks?focus={entry.task.id}">{esc(entry.task.title)}</a>{blocked}</td>'
         f'<td>{goal_text}</td><td>{entry.task.priority.value}</td><td>{planned}</td></tr>'
     )
 

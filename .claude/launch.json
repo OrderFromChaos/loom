@@ -4,8 +4,16 @@
     {
       "name": "loom",
       "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "loom", "serve", "--area", "demo"],
-      "port": 8321
+      "runtimeArgs": [
+        "run",
+        "loom",
+        "serve",
+        "--area",
+        "demo",
+        "--port",
+        "8322"
+      ],
+      "port": 8322
     }
   ]
 }

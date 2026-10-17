@@ -7,6 +7,7 @@ WeeklyWindow times and WebConfig times are local wall-clock in the configured ti
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -20,15 +21,11 @@ TaskId = NewType('TaskId', str)
 GoalId = NewType('GoalId', str)
 EventId = NewType('EventId', str)
 RecurringId = NewType('RecurringId', str)
+StepId = NewType('StepId', str)
 Color = NewType('Color', str)
+Area = NewType('Area', str)  # a data area name; the [areas.*] tables in loom.toml define the set
 
 DAY_NAMES = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')  # index = datetime.weekday()
-
-
-class Area(Enum):
-    WORK = 'work'
-    PERSONAL = 'personal'
-    DEMO = 'demo'  # sample data lives here, never in the real areas
 
 
 class Status(Enum):
@@ -60,6 +57,11 @@ class Reason(Enum):
     DEPENDENCY_BLOCKED = 'dependency-blocked'
     NO_ROOM = 'no-room'
     MISSES_DEADLINE = 'misses-deadline'
+
+
+class TaskOrder(Enum):
+    DEADLINE = 'deadline'  # deadlined tasks first, then priority: the default
+    SHORTEST = 'shortest-first'  # least estimated time first: quick wins before long haul
 
 
 class EventKind(Enum):
@@ -99,6 +101,12 @@ class Task:
     completed: datetime | None
     origin: RecurringId | None = None  # the template this task was spawned from
     color: str | None = None  # palette preset NAME; None falls back to keyword then area color
+    not_before: datetime | None = None  # the scheduler places nothing earlier, e.g. when an office opens
+
+
+@dataclass(frozen=True)
+class Preferences:
+    order: TaskOrder  # how the scheduler orders auto tasks, and how the Auto group lists them
 
 
 @dataclass(frozen=True)
@@ -113,8 +121,21 @@ class RecurringTask:
     days: frozenset[int]  # anchored weekday numbers, Monday = 0; empty in interval mode
     every_days: int | None  # interval mode: days since the last completed copy; None in anchored mode
     deadline_after_days: int | None  # copy's deadline = its occurrence date + this; None = no deadline
+    wait_for_completion: bool  # True: one open copy at most, and an interval restarts at completion
     created: datetime
-    last_added: datetime | None  # spawn cursor: when a copy was last spawned
+    last_added: datetime | None  # spawn cursor: the clock the next occurrence counts from
+    next_due: date | None = None  # interval only: a hand-set next occurrence; cleared once it spawns
+
+
+@dataclass(frozen=True)
+class RecurringStep:
+    id: StepId
+    template: RecurringId  # the template this step belongs to
+    parent: StepId | None  # None: directly under the template; steps nest without limit
+    title: str
+    estimate_minutes: int | None
+    auto_schedule: bool
+    created: datetime  # sibling order, oldest first
 
 
 @dataclass(frozen=True)
@@ -156,6 +177,7 @@ class Plan:
     generated: datetime
     blocks: tuple[PlanBlock, ...]
     unplaced: tuple[Unplaced, ...]
+    at_risk: tuple[TaskId, ...] = ()  # shortest-first only: deadlined tasks moved ahead so they fit
 
 
 @dataclass(frozen=True)
@@ -177,6 +199,26 @@ class Placement:
 
 
 @dataclass(frozen=True)
+class TasksByBucket:
+    """The standard ADHD ordering: four buckets, listed and placed top to bottom."""
+
+    at_risk: tuple[Task, ...]  # deadline at risk, soonest deadline first
+    quickest: tuple[Task, ...]  # doable now, fewest estimated minutes first
+    not_yet: tuple[Task, ...]  # not_before still ahead, soonest first
+    unestimated: tuple[Task, ...]  # no estimate: listed, never placed; input order kept
+
+    def placementQueue(self) -> tuple[Task, ...]:
+        """Every placeable task in bucket order; the unestimated have nothing to place."""
+        return (*self.at_risk, *self.quickest, *self.not_yet)
+
+
+@dataclass(frozen=True)
+class OrderedPlacement:
+    placement: Placement
+    at_risk: frozenset[TaskId]  # deadlined tasks that jumped the shortest-first queue
+
+
+@dataclass(frozen=True)
 class WeeklyWindow:
     days: frozenset[int]  # weekday numbers, Monday = 0
     start: time
@@ -184,9 +226,9 @@ class WeeklyWindow:
 
 
 @dataclass(frozen=True)
-class KeywordColor:
-    keyword: str
-    color: Color
+class CategoryRule:
+    pattern: re.Pattern[str]  # searched against a task title, case-insensitive
+    category: str  # a palette preset name, which carries the color
 
 
 @dataclass(frozen=True)
@@ -208,6 +250,8 @@ class WebConfig:
 class AreaConfig:
     windows: tuple[WeeklyWindow, ...]
     color: Color
+    finished: date | None  # the day it was finished: off the switcher, no longer planned; data kept
+    hidden: bool  # still planned, but off the switcher: reached from its + menu (the demo area)
 
 
 @dataclass(frozen=True)
@@ -218,12 +262,14 @@ class Config:
     scheduler: SchedulerConfig
     web: WebConfig
     areas: Mapping[Area, AreaConfig]
-    colors: tuple[KeywordColor, ...]  # match order: first hit wins
-    palette: Mapping[str, Color]  # named presets a task can point at by name
+    palette: Mapping[str, Color]  # the categories: named presets a task can point at
+    categories: tuple[CategoryRule, ...]  # automatic assignment; match order: first hit wins
 
 
 # a mapping stays a mapping: the None key groups the root tasks
 ChildIndex = dict[TaskId | None, tuple[Task, ...]]
+# one template's steps under their parent step; the None key groups the top level
+StepIndex = dict[StepId | None, tuple[RecurringStep, ...]]
 
 
 @dataclass(frozen=True)

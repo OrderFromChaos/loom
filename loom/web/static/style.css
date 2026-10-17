@@ -1,6 +1,7 @@
 /* loom: dark, quiet, calendar-first */
 
 :root {
+  color-scheme: dark;
   --bg: #0d1117;
   --panel: #161b22;
   --line: #30363d;
@@ -13,6 +14,9 @@
 }
 
 * { box-sizing: border-box; }
+/* the canvas keeps the page color while the body is held unpainted */
+html { background: var(--bg); }
+html.restoring body { visibility: hidden; }
 body {
   margin: 0;
   background: var(--bg);
@@ -38,6 +42,25 @@ main.view-calendar { max-width: none; }
 .areas { display: flex; gap: 0.5rem; align-items: center; }
 .area-now { font-weight: 700; text-transform: uppercase; font-size: 0.8rem; }
 .area-link { color: var(--muted); text-transform: uppercase; font-size: 0.8rem; }
+.area-now, .area-link { border-bottom: 2px solid var(--area-color, transparent); padding-bottom: 1px; }
+.area-link:hover { text-decoration: none; color: var(--text); }
+.area-now.finished, .area-link.finished { text-decoration: line-through; }
+.areas [data-area-name].dragging { opacity: 0.4; }
+.area-menu { position: relative; }
+.area-menu > summary {
+  list-style: none; cursor: pointer; color: var(--muted); padding: 0 0.35rem;
+  border: 1px solid transparent; border-radius: 4px;
+}
+.area-menu > summary::-webkit-details-marker { display: none; }
+.area-menu > summary:hover, .area-menu[open] > summary { border-color: var(--line); color: var(--text); }
+.area-menu-panel {
+  position: absolute; right: 0; top: calc(100% + 0.4rem); z-index: 30; min-width: 20rem;
+  padding: 0.5rem 0.7rem; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+}
+.area-menu-panel .add-form input[name='name'] { min-width: 0; flex: 1; }
+.finished-areas { list-style: none; margin: 0.4rem 0 0; padding: 0.4rem 0 0; border-top: 1px solid var(--line); }
+.finished-areas li { display: flex; align-items: center; gap: 0.4rem; margin: 0.15rem 0; }
+.area-end { margin: 1.4rem 0 0.5rem; text-align: right; }
 
 /* ── shared bits ─────────────────────────────────────── */
 .button {
@@ -69,6 +92,7 @@ label { color: var(--muted); font-size: 0.85rem; }
 /* ── week grid ───────────────────────────────────────── */
 .week-nav { display: flex; gap: 0.4rem; align-items: center; margin: 0.6rem 0; }
 .week-title { color: var(--muted); margin-left: 0.6rem; }
+.week-nav .reschedule { margin-left: auto; }
 .week-scroll {
   max-height: 82vh; overflow-y: auto;
   border: 1px solid var(--line); border-radius: 8px;
@@ -112,6 +136,27 @@ label { color: var(--muted); font-size: 0.85rem; }
   color: transparent; cursor: pointer; font-size: 0.7rem; line-height: 1;
 }
 .tick:hover { color: #3fb950; border-color: #3fb950; background: #3fb95022; }
+.tick.undo { color: #3fb950; border-color: #3fb950; }
+.tick.undo:hover { color: transparent; border-color: var(--muted); background: transparent; }
+/* a template step's box: the same shape as a task's, but nothing to tick */
+.tick.inert { display: inline-block; cursor: default; }
+.tick.inert:hover { color: transparent; border-color: var(--muted); background: transparent; }
+.est-form { display: inline-flex; align-items: center; gap: 0.12rem; color: var(--muted); font-size: 0.68rem; }
+.est-form input {
+  width: 3rem; padding: 0 0.3rem; font-size: 0.7rem; text-align: right; line-height: 1.4;
+  background: transparent; border: 1px solid var(--line); border-radius: 999px; color: var(--text);
+  appearance: textfield;
+}
+.est-form input::-webkit-outer-spin-button, .est-form input::-webkit-inner-spin-button {
+  -webkit-appearance: none; margin: 0;
+}
+.est-form input:focus { border-color: var(--accent); outline: none; }
+.auto-toggle, .order-toggle {
+  font-size: 0.68rem; padding: 0 0.4rem; border-radius: 999px; cursor: pointer;
+  background: transparent; border: 1px solid var(--line); color: var(--muted); line-height: 1.4;
+}
+.auto-toggle:hover, .order-toggle:hover { border-color: var(--accent); color: var(--text); }
+.auto-toggle.on, .order-toggle.on { color: var(--accent); border-color: var(--accent); }
 .block .tick { border-color: #0d1117aa; margin-right: 0.25rem; }
 .block .tick:hover { color: #0d1117; border-color: #0d1117; background: #0d111733; }
 .done-mark { color: #3fb950; font-weight: 700; }
@@ -144,6 +189,31 @@ label { color: var(--muted); font-size: 0.85rem; }
 .goal h2 { margin: 0.1rem 0 0.5rem; font-size: 1.05rem; }
 .goal-head { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; margin-bottom: 0.4rem; }
 .goal-head h2 { margin: 0; }
+summary.goal-head { cursor: pointer; list-style: none; }
+summary.goal-head::-webkit-details-marker { display: none; }
+summary.goal-head::before { content: '\25B8'; color: var(--muted); font-size: 0.8rem; }
+details.goal[open] > summary.goal-head::before { content: '\25BE'; }
+details.goal > .panel { display: none; margin: 0.2rem 0 0.4rem 1rem; }
+details.goal > .goal-edit-state:checked ~ .edit-panel { display: block; }
+/* the finished line mirrors a task row's layout so its caret sits in the same slot */
+.finished-tasks > summary {
+  cursor: pointer; color: var(--muted); font-size: 0.78rem; padding: 0.1rem 0.2rem;
+  list-style: none; display: flex; align-items: center; gap: 0.4rem;
+}
+.finished-tasks > summary::-webkit-details-marker { display: none; }
+.finished-tasks > summary::before {
+  content: '\25B8'; flex: none; width: 0.7rem; text-align: center; font-size: 0.75rem;
+}
+.finished-tasks[open] > summary::before { transform: rotate(90deg); }
+.finished-tasks { margin: 0.1rem 0; }
+.all-goals { margin: 0.9rem 0; }
+.all-goals > summary { cursor: pointer; color: var(--muted); padding: 0.2rem 0.3rem; }
+.crumb { color: var(--muted); font-size: 0.72rem; }
+.next-form .badge { display: inline-flex; align-items: center; gap: 0.25rem; }
+.next-form input[type='date'] {
+  padding: 0 0.2rem; font-size: 0.68rem; border: none; background: transparent; color: var(--text);
+}
+.lane-divider { border: none; border-top: 1px solid var(--line); margin: 0.35rem 0; }
 h2.done { text-decoration: line-through; color: var(--muted); }
 .finished-goals > summary { cursor: pointer; color: var(--muted); }
 .starving { color: #d29922; font-size: 0.8rem; font-weight: 400; }
@@ -155,17 +225,27 @@ details.task > summary {
 }
 details.task > summary:hover { background: #1c2129; }
 
-/* collapsed toggles living inside the row; open ones drop to a full-width panel below */
-.inline-panel { display: inline-flex; }
-.inline-panel > summary {
-  cursor: pointer; color: var(--muted); font-size: 0.78rem; list-style: none;
+/* the caret marks a task with folded content; the count says how many open steps hide
+   inside a collapsed parent, and vanishes once they are on screen */
+.twist { flex: none; width: 0.7rem; text-align: center; color: var(--muted); font-size: 0.75rem; }
+details.task[open] > summary > .twist { transform: rotate(90deg); }
+.sub-count {
+  font-size: 0.68rem; padding: 0 0.35rem; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted);
+}
+details.task[open] > summary > .sub-count { display: none; }
+
+/* row toggles: a hidden checkbox per panel, flipped by an inline label in the row.
+   The edit panel sits under the row; the add line sits below the children. */
+.panel-state { display: none; }
+.row-toggle {
+  cursor: pointer; color: var(--muted); font-size: 0.78rem;
   padding: 0 0.4rem; border: 1px solid transparent; border-radius: 4px; line-height: 1.4;
 }
-.inline-panel > summary::-webkit-details-marker { display: none; }
-.inline-panel > summary:hover { border-color: var(--line); color: var(--text); }
-.inline-panel[open] { display: block; flex-basis: 100%; order: 99; }
-.inline-panel[open] > summary { display: inline-block; }
-.inline-panel > .panel { margin: 0.25rem 0 0.15rem; }
+.row-toggle:hover { border-color: var(--line); color: var(--text); }
+details.task > .panel { display: none; margin: 0.2rem 0 0.25rem 2.1rem; }
+details.task > .edit-state:checked ~ .edit-panel { display: block; }
+details.task > .add-state:checked ~ .child-adder { display: block; }
 .children:empty { display: none; }
 .title.done { text-decoration: line-through; color: var(--muted); }
 .title.focused { outline: 2px solid var(--accent); border-radius: 4px; padding: 0 0.2rem; }
@@ -177,6 +257,7 @@ details.task > summary:hover { background: #1c2129; }
   border: 1px solid var(--line); color: var(--muted);
 }
 .badge.deadline { color: #d29922; border-color: #d29922; }
+.badge.not-before { color: var(--accent); border-color: var(--accent); }
 .badge.deadline.overdue { color: var(--danger); border-color: var(--danger); }
 .badge.auto { color: var(--accent); border-color: var(--accent); }
 .badge.dep-blocked, .badge.waiting { color: var(--danger); border-color: var(--danger); }
@@ -190,6 +271,9 @@ details.task > summary:hover { background: #1c2129; }
 .chip-x { background: none; border: none; color: var(--danger); cursor: pointer; }
 .notes { color: var(--muted); font-size: 0.8rem; margin: 0.1rem 0 0.3rem; }
 details.edit { font-size: 0.85rem; }
+.recurring-card > .panel { display: none; margin: 0.2rem 0 0.25rem 1rem; }
+.recurring-card > .add-state:checked ~ .child-adder { display: block; }
+.steps:empty { display: none; }
 details.edit > summary { cursor: pointer; color: var(--muted); }
 .edit-form, .dep-form { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin: 0.4rem 0; }
 .add-form { display: flex; gap: 0.4rem; align-items: center; margin: 0.25rem 0; }
@@ -197,6 +281,15 @@ details.edit > summary { cursor: pointer; color: var(--muted); }
 .add-form .minutes { width: 4.5rem; }
 .check { display: inline-flex; align-items: center; gap: 0.25rem; }
 .cycle { color: var(--danger); font-weight: 600; margin: 0.2rem 0; }
+
+/* ── achievements ────────────────────────────────────── */
+.ach-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.12rem 0.2rem; }
+.ach-time { color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.ach-dot {
+  width: 0.55rem; height: 0.55rem; border-radius: 50%; flex: none;
+  background: var(--block-color, var(--accent));
+}
+.badge.done-count { color: #3fb950; border-color: #3fb950; font-weight: 700; }
 
 /* ── settings ────────────────────────────────────────── */
 .swatch {

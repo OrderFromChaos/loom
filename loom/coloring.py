@@ -1,7 +1,8 @@
-"""Pick a calendar color: a task's palette preset first, then keywords, then the area.
+"""Pick a calendar color: manual category first, then category rules, then the area.
 
-Stored data carries at most a preset name; the hex it resolves to lives in loom.toml,
-so recoloring a preset recolors everything pointing at it.
+A category is a palette preset; its hex lives in loom.toml, so recoloring a category
+recolors everything assigned to it, manually or by rule. Stored data carries at most a
+category name.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from loom.vocabulary import Area, Color, Task
 
 
 def colorForTask(task: Task, area: Area) -> Color:
-    """The task's palette preset when set and known; otherwise keyword matching."""
+    """The task's manual category when set and known; otherwise the title rules."""
     if task.color is not None:
         preset = CONFIG.palette.get(task.color)
         if preset is not None:
@@ -21,14 +22,20 @@ def colorForTask(task: Task, area: Area) -> Color:
 
 
 def colorForTitle(title: str, area: Area) -> Color:
-    """Case-insensitive substring match, first [colors] entry in file order wins.
-
-    tomllib preserves the table's file order, which is what makes "first" meaningful.
-    No match falls back to the area's own color.
-    """
-    lowered = title.lower()
-    for entry in CONFIG.colors:
-        if entry.keyword.lower() in lowered:
-            return entry.color
+    """The first [categories] rule whose regex matches decides; no match, area color."""
+    category = categoryForTitle(title)
+    if category is not None:
+        preset = CONFIG.palette.get(category)
+        if preset is not None:
+            return preset
 
     return CONFIG.areas[area].color
+
+
+def categoryForTitle(title: str) -> str | None:
+    """The first matching rule's category name, None when no rule matches."""
+    for rule in CONFIG.categories:
+        if rule.pattern.search(title):
+            return rule.category
+
+    return None

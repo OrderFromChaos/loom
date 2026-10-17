@@ -50,7 +50,7 @@ def renderCalendarPage(
     edit_event: LoggedEvent | None,
 ) -> str:
     """The whole calendar page for one week, as HTML."""
-    here = f'/{area.value}/calendar?week={week_monday.isoformat()}'
+    here = f'/{area}/calendar?week={week_monday.isoformat()}'
     days = [week_monday + timedelta(days=offset) for offset in range(7)]
     planned = _plannedItems(area, tasks, plan, fixed, stale, now)
     actual = _actualItems(area, tasks, events, here)
@@ -60,9 +60,9 @@ def renderCalendarPage(
     )
     day_rem = (_dayEndMinute() - _dayStartMinute()) / 60.0 * _HOUR_REM
     body = (
-        f'{_renderWeekNav(area, week_monday)}'
+        f'{_renderWeekNav(area, week_monday, here)}'
         f'{_renderUnplacedBanner(area, tasks, plan)}'
-        f'{_renderStaleBanner(area, tasks, stale, here)}'
+        f'{_renderStaleBanner(area, tasks, stale)}'
         f'<div class="week-scroll"><div class="week" style="--day-rem:{day_rem:.1f}rem" '
         f'data-day-start="{_dayStartMinute()}" data-day-end="{_dayEndMinute()}" '
         f'data-scroll-start="{_scrollMinute()}">\n'
@@ -72,16 +72,20 @@ def renderCalendarPage(
     return renderPage(f'{week_monday.isoformat()} calendar', area, View.CALENDAR, body)
 
 
-def _renderWeekNav(area: Area, week_monday: date) -> str:
+def _renderWeekNav(area: Area, week_monday: date, here: str) -> str:
+    """Week arrows and title on the left, the re-plan button on the right."""
     previous_week = (week_monday - timedelta(days=7)).isoformat()
     next_week = (week_monday + timedelta(days=7)).isoformat()
-    base = f'/{area.value}/calendar'
+    base = f'/{area}/calendar'
     return (
         f'<div class="week-nav">'
         f'<a class="button" href="{base}?week={previous_week}">&larr;</a>'
         f'<a class="button" href="{base}">today</a>'
         f'<a class="button" href="{base}?week={next_week}">&rarr;</a>'
         f'<span class="week-title">week of {week_monday.isoformat()}</span>'
+        f'<form method="post" action="/{area}/reschedule" class="inline-form reschedule">'
+        f'<input type="hidden" name="return_to" value="{esc(here)}">'
+        f'<button class="button" title="re-plan after editing files by hand">Reschedule</button></form>'
         f'</div>'
     )
 
@@ -91,33 +95,24 @@ def _renderUnplacedBanner(area: Area, tasks: Mapping[TaskId, Task], plan: Plan |
         return ''
 
     entries = '\n'.join(
-        f'<li><a href="/{area.value}/tasks?focus={entry.task}">{_titleOf(entry.task, tasks)}</a>'
+        f'<li><a href="/{area}/tasks?focus={entry.task}">{_titleOf(entry.task, tasks)}</a>'
         f' &mdash; {_reasonText(entry.reason)}</li>'
         for entry in plan.unplaced
     )
     return f'<div class="banner warn"><strong>{len(plan.unplaced)} not scheduled:</strong><ul>{entries}</ul></div>'
 
 
-def _renderStaleBanner(
-    area: Area,
-    tasks: Mapping[TaskId, Task],
-    stale: frozenset[TaskId],
-    here: str,
-) -> str:
-    """The stale-task banner with per-task ack buttons, empty when nothing is stale."""
+def _renderStaleBanner(area: Area, tasks: Mapping[TaskId, Task], stale: frozenset[TaskId]) -> str:
+    """The stale-task banner: open tasks past their deadline, empty when there are none."""
     if not stale:
         return ''
 
     entries = '\n'.join(
-        f'<li><a href="/{area.value}/tasks?focus={task_id}">{_titleOf(task_id, tasks)}</a>'
-        f'<form method="post" action="/{area.value}/ack/{task_id}" class="inline-form">'
-        f'<input type="hidden" name="return_to" value="{esc(here)}">'
-        f'<button class="button small">ack</button></form></li>'
-        for task_id in sorted(stale)
+        f'<li><a href="/{area}/tasks?focus={task_id}">{_titleOf(task_id, tasks)}</a></li>'
+        for task_id in sorted(stale, key=lambda task_id: (tasks[task_id].deadline, task_id))
     )
     return (
-        f'<div class="banner stale-banner"><strong>{len(stale)} stale '
-        f'(planned time passed, no tick or log):</strong><ul>{entries}</ul></div>'
+        f'<div class="banner stale-banner"><strong>{len(stale)} stale (past deadline):</strong><ul>{entries}</ul></div>'
     )
 
 
@@ -222,7 +217,7 @@ def _renderLogPanel(
     """The log-an-event form; prefilled for an edit, otherwise blank for a new entry."""
     zone = CONFIG.timezone
     if edit_event is not None and edit_event.start is not None and edit_event.end is not None:
-        action = f'/{area.value}/log/{edit_event.id}/edit'
+        action = f'/{area}/log/{edit_event.id}/edit'
         heading = 'Edit logged event'
         day_value = edit_event.start.astimezone(zone).date().isoformat()
         start_value = edit_event.start.astimezone(zone).strftime('%H:%M')
@@ -230,12 +225,12 @@ def _renderLogPanel(
         note_value = edit_event.note
         task_value = edit_event.task
         delete = (
-            f'<form method="post" action="/{area.value}/log/{edit_event.id}/delete" class="inline-form">'
+            f'<form method="post" action="/{area}/log/{edit_event.id}/delete" class="inline-form">'
             f'<input type="hidden" name="return_to" value="{esc(here)}">'
             f'<button class="button danger">delete</button></form>'
         )
     else:
-        action = f'/{area.value}/log'
+        action = f'/{area}/log'
         heading = 'Log what actually happened'
         day_value = ''
         start_value = ''
@@ -286,7 +281,7 @@ def _plannedItems(
         resize_attrs = ''
         if task is not None and task.completed is None and task.estimate_minutes is not None:
             resize_attrs = (
-                f'data-kind="planned" data-endpoint="/{area.value}/tasks/{block.task}/estimate" '
+                f'data-kind="planned" data-endpoint="/{area}/tasks/{block.task}/estimate" '
                 f'data-estimate="{task.estimate_minutes}"'
             )
 
@@ -298,8 +293,8 @@ def _plannedItems(
                 color=colorForTask(task, area) if task is not None else colorForTitle(title, area),
                 css=css,
                 tick_task=block.task if tickable else None,
-                tick_action=f'/{area.value}/tasks/{block.task}/tick',
-                link=f'/{area.value}/tasks?focus={block.task}',
+                tick_action=f'/{area}/tasks/{block.task}/tick',
+                link=f'/{area}/tasks?focus={block.task}',
                 resize_attrs=resize_attrs,
             ),
         )
@@ -344,7 +339,7 @@ def _actualItems(
         local_start = event.start.astimezone(zone)
         local_end = event.end.astimezone(zone)
         resize_attrs = (
-            f'data-kind="actual" data-endpoint="/{area.value}/log/{event.id}/edit" '
+            f'data-kind="actual" data-endpoint="/{area}/log/{event.id}/edit" '
             f'data-day="{local_start.date().isoformat()}" data-start="{local_start.strftime("%H:%M")}" '
             f'data-end="{local_end.strftime("%H:%M")}" data-note="{esc(event.note)}" '
             f'data-task-ref="{event.task or ""}"'

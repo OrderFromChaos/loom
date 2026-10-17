@@ -20,6 +20,11 @@ def stillOpen(task: Task) -> bool:
     return task.status in _OPEN_STATUSES
 
 
+def notYet(task: Task, now: datetime) -> bool:
+    """True while the task's not_before is still ahead: it cannot be done yet."""
+    return task.not_before is not None and task.not_before > now
+
+
 def childrenByParent(tasks: Mapping[TaskId, Task]) -> ChildIndex:
     """Group tasks under their parent id (None groups the roots).
 
@@ -48,6 +53,21 @@ def effectiveGoal(task: Task, tasks: Mapping[TaskId, Task]) -> GoalId | None:
         current = parent
 
     return current.goal
+
+
+def subtreeIds(root: TaskId, tasks: Mapping[TaskId, Task]) -> frozenset[TaskId]:
+    """A task and every task beneath it; a parent cycle cannot trap the walk."""
+    children = childrenByParent(tasks)
+    found: set[TaskId] = set()
+    stack = [root]
+    while stack:
+        task_id = stack.pop()
+        if task_id in found:
+            continue
+        found.add(task_id)
+        stack.extend(child.id for child in children.get(task_id, ()))
+
+    return frozenset(found)
 
 
 def ancestorsOf(task_id: TaskId, tasks: Mapping[TaskId, Task]) -> tuple[TaskId, ...]:

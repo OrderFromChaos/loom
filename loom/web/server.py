@@ -10,10 +10,12 @@ can never interleave with another request.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import sys
+import time as clock
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -24,11 +26,21 @@ from typing import TypeVar
 from urllib.parse import parse_qsl, urlsplit
 
 from loom import recurring
-from loom.config import CONFIG, saveAreaWindows, saveKeywordColors, savePalette
+from loom.config import (
+    CONFIG,
+    openAreas,
+    saveAreaColor,
+    saveAreaFinished,
+    saveAreaOrder,
+    saveAreaWindows,
+    saveCategoryRules,
+    saveNewArea,
+    savePalette,
+)
 from loom.graph import goalSortKey
 from loom.scheduler import runPlan
-from loom.store import newEventId, newGoalId, newRecurringId, newTaskId, storeFor
-from loom.triage import deadlineTasks, staleTaskIds
+from loom.store import newEventId, newGoalId, newRecurringId, newStepId, newTaskId, storeFor
+from loom.triage import deadlineTasks, overdueTaskIds
 from loom.vocabulary import (
     DAY_NAMES,
     Area,
@@ -40,13 +52,17 @@ from loom.vocabulary import (
     LoggedEvent,
     Priority,
     RecurringId,
+    RecurringStep,
     RecurringTask,
     Status,
+    StepId,
     StoreConflictError,
     StoreError,
     Task,
     TaskId,
+    TaskOrder,
 )
+from loom.web.achievements_page import renderAchievementsPage
 from loom.web.calendar_page import renderCalendarPage
 from loom.web.deadlines_page import renderDeadlinesPage
 from loom.web.page_shell import esc
@@ -61,27 +77,72 @@ _STATIC_FILES = {
     'style.css': 'text/css; charset=utf-8',
     'calendar.js': 'text/javascript; charset=utf-8',
     'tree.js': 'text/javascript; charset=utf-8',
+    'pickers.js': 'text/javascript; charset=utf-8',
+    'areas.js': 'text/javascript; charset=utf-8',
+    'restore.js': 'text/javascript; charset=utf-8',
 }
 _HTML = 'text/html; charset=utf-8'
 
+# the restart page carries its own look: the stylesheet cannot load while the server is down
+_RESTART_STYLE = (
+    'html,body{margin:0;background:#0d1117;color:#e6edf3;'
+    "font:14px/1.45 system-ui,-apple-system,'Segoe UI',sans-serif}"
+    'main{padding:0.75rem 1rem}a{color:#58a6ff}'
+    '.banner{border:1px solid #30363d;border-radius:8px;background:#161b22;padding:0.6rem 0.9rem;margin:0.6rem 0}'
+)
+_RESTART_POLL = """(function () {
+  const target = TARGET;
+  function poll() {
+    fetch('/static/style.css', { cache: 'no-store' })
+      .then((response) => { if (response.ok) window.location.replace(target); else setTimeout(poll, 300); })
+      .catch(() => setTimeout(poll, 300));
+  }
+  setTimeout(poll, 300);
+})();"""
+
 LOG = logging.getLogger('loom')
 
-HOME_AREA = Area.WORK  # where GET / lands; serveForever sets it from the CLI
+HOME_AREA = Area('work')  # where GET / lands; serveForever sets it from the CLI
+PORT = 0  # the listening port; serveForever sets it, and a settings restart reuses it
+
+_HOUSEKEEPING_SECONDS = 300
 
 
-def serveForever(home: Area) -> int:
-    global HOME_AREA
+def serveForever(home: Area, port: int) -> int:
+    """Serve requests and, between them, keep recurring copies spawned in every area.
+
+    Housekeeping runs at startup and then every five minutes in this same thread, so a
+    copy appears on its day without anyone opening the page, and requests and
+    housekeeping still never interleave.
+    """
+    global HOME_AREA, PORT
     HOME_AREA = home
-    server = HTTPServer(('127.0.0.1', CONFIG.web.port), _Handler)
-    print(f'loom serving http://127.0.0.1:{CONFIG.web.port}/ (home: {home.value})')
+    PORT = port
+    server = HTTPServer(('127.0.0.1', port), _Handler)
+    print(f'loom serving http://127.0.0.1:{port}/ (home: {home})', flush=True)
     try:
-        server.serve_forever()
+        next_housekeeping = 0.0
+        while True:
+            if clock.monotonic() >= next_housekeeping:
+                _housekeep(datetime.now(UTC))
+                next_housekeeping = clock.monotonic() + _HOUSEKEEPING_SECONDS
+            server.timeout = max(0.0, next_housekeeping - clock.monotonic())
+            server.handle_request()
     except KeyboardInterrupt:
         print('stopped')
     finally:
         server.server_close()
 
     return 0
+
+
+def _housekeep(now: datetime) -> None:
+    """Spawn owed recurring copies in every open area; a broken area is logged and skipped."""
+    for area in openAreas():
+        try:
+            _freshenArea(area, now)
+        except StoreError as exc:
+            LOG.warning('housekeeping.skipped', extra={'area': area, 'error': str(exc)})
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -122,7 +183,7 @@ def _dispatch(handler: _Handler, method: str) -> None:
             # listening socket reopens on the same port a moment later
             handler.wfile.flush()
             LOG.info('server.restarting', extra={'reason': 'settings saved'})
-            os.execv(sys.executable, [sys.executable, '-m', 'loom', 'serve', '--area', HOME_AREA.value])
+            os.execv(sys.executable, [sys.executable, '-m', 'loom', 'serve', '--area', HOME_AREA, '--port', str(PORT)])
         return
 
     _send(handler, _errorPage(404, 'Not found', f'no route for {method} {esc(split.path)}'))
@@ -140,7 +201,7 @@ def _send(handler: _Handler, response: _Response) -> None:
 
 
 def _home(request: _Request) -> _Response:
-    return _redirect(f'/{HOME_AREA.value}/calendar')
+    return _redirect(f'/{HOME_AREA}/calendar')
 
 
 def _static(request: _Request) -> _Response:
@@ -164,11 +225,10 @@ def _calendarPage(request: _Request) -> _Response:
     area_store = storeFor(area)
     tasks = area_store.loadTasks()
     plan = area_store.loadPlan()
-    history = area_store.loadPlanHistory()
     events = area_store.loadEvents()
     fixed = area_store.loadFixed()
 
-    stale = staleTaskIds(tasks, plan, history, events, now)
+    stale = overdueTaskIds(tasks, now)
     edit_id = request.query.get('edit')
     edit_event = next((event for event in events if event.id == edit_id), None)
     body = renderCalendarPage(
@@ -186,13 +246,19 @@ def _calendarPage(request: _Request) -> _Response:
 
 
 def _tasksPage(request: _Request) -> _Response:
+    """The goal tree and Auto group, laid out with the saved plan's at-risk set.
+
+    Raises:
+        StoreError: a data file of this area is unreadable or malformed.
+    """
     area = _areaOf(request)
     now = datetime.now(UTC)
     _freshenArea(area, now)
     area_store = storeFor(area)
     tasks = area_store.loadTasks()
 
-    stale = staleTaskIds(tasks, area_store.loadPlan(), area_store.loadPlanHistory(), area_store.loadEvents(), now)
+    plan = area_store.loadPlan()
+    stale = overdueTaskIds(tasks, now)
     root = request.query.get('root')
     focus = request.query.get('focus')
     body = renderTasksPage(
@@ -202,6 +268,8 @@ def _tasksPage(request: _Request) -> _Response:
         stale=stale,
         root=TaskId(root) if root else None,
         focus=TaskId(focus) if focus else None,
+        order=area_store.loadPreferences().order,
+        at_risk=frozenset(plan.at_risk) if plan is not None else frozenset(),
     )
     return _html(body)
 
@@ -218,6 +286,13 @@ def _deadlinesPage(request: _Request) -> _Response:
     return _html(renderDeadlinesPage(area, entries=entries, plan=plan, tasks=tasks))
 
 
+def _achievementsPage(request: _Request) -> _Response:
+    area = _areaOf(request)
+    area_store = storeFor(area)
+
+    return _html(renderAchievementsPage(area, tasks=area_store.loadTasks(), goals=area_store.loadGoals()))
+
+
 def _recurringPage(request: _Request) -> _Response:
     area = _areaOf(request)
     _freshenArea(area, datetime.now(UTC))
@@ -226,6 +301,7 @@ def _recurringPage(request: _Request) -> _Response:
     body = renderRecurringPage(
         area,
         templates=area_store.loadRecurring(),
+        steps=area_store.loadSteps(),
         goals=area_store.loadGoals(),
         tasks=area_store.loadTasks(),
     )
@@ -260,6 +336,7 @@ def _addRecurring(request: _Request) -> _Response:
         days=days,
         every_days=every,
         deadline_after_days=_optionalDayCountField(request.form, 'deadline_after_days'),
+        wait_for_completion='wait_for_completion' in request.form,
         created=datetime.now(UTC),
         last_added=None,
     )
@@ -291,6 +368,7 @@ def _editRecurring(request: _Request) -> _Response:
         days=days,
         every_days=every,
         deadline_after_days=_optionalDayCountField(request.form, 'deadline_after_days'),
+        wait_for_completion='wait_for_completion' in request.form,
     )
     area_store.saveRecurring(templates)
     return _redirect(_returnTo(request, area))
@@ -304,16 +382,126 @@ def _deleteRecurring(request: _Request) -> _Response:
 
     del templates[template.id]
     area_store.saveRecurring(templates)
+    steps = area_store.loadSteps()
+    if any(step.template == template.id for step in steps.values()):
+        area_store.saveSteps({step_id: step for step_id, step in steps.items() if step.template != template.id})
     return _redirect(_returnTo(request, area))
 
 
-def _spawnRecurring(request: _Request) -> _Response:
+def _addStep(request: _Request) -> _Response:
+    """Add a step under a template, or under one of that template's steps.
+
+    Raises:
+        FormError: the template or parent step does not exist, or a field is malformed.
+    """
     area = _areaOf(request)
-    templates = storeFor(area).loadRecurring()
-    template = _recurringOf(request, templates)
+    area_store = storeFor(area)
+    template = _recurringOf(request, area_store.loadRecurring())
+    steps = area_store.loadSteps()
+
+    parent_text = request.form.get('parent', '').strip()
+    parent = StepId(parent_text) if parent_text else None
+    if parent is not None and (parent not in steps or steps[parent].template != template.id):
+        raise FormError(f'step {parent} is not part of {template.title!r}')
+
+    step = RecurringStep(
+        id=newStepId(),
+        template=template.id,
+        parent=parent,
+        title=_requireField(request.form, 'title'),
+        estimate_minutes=_optionalIntField(request.form, 'estimate_minutes'),
+        auto_schedule='auto_schedule' in request.form,
+        created=datetime.now(UTC),
+    )
+    steps[step.id] = step
+    area_store.saveSteps(steps)
+    return _redirect(_returnTo(request, area))
+
+
+def _editStep(request: _Request) -> _Response:
+    """Apply a step's edit form; copies already spawned keep what they were given.
+
+    Raises:
+        FormError: the step does not exist, or a field is malformed.
+    """
+    area = _areaOf(request)
+    area_store = storeFor(area)
+    steps = area_store.loadSteps()
+    step = _stepOf(request, steps)
+
+    steps[step.id] = replace(
+        step,
+        title=_requireField(request.form, 'title'),
+        estimate_minutes=_optionalIntField(request.form, 'estimate_minutes'),
+        auto_schedule='auto_schedule' in request.form,
+    )
+    area_store.saveSteps(steps)
+    return _redirect(_returnTo(request, area))
+
+
+def _deleteStep(request: _Request) -> _Response:
+    """Delete a step and every step beneath it.
+
+    Raises:
+        FormError: the step does not exist.
+    """
+    area = _areaOf(request)
+    area_store = storeFor(area)
+    steps = area_store.loadSteps()
+    doomed = recurring.stepSubtree(_stepOf(request, steps).id, steps)
+    area_store.saveSteps({step_id: step for step_id, step in steps.items() if step_id not in doomed})
+    return _redirect(_returnTo(request, area))
+
+
+def _pullAhead(request: _Request) -> _Response:
+    """Spawn a copy now and restart the template's clock from now, then re-plan.
+
+    Raises:
+        FormError: the template does not exist, or it waits for completion and a copy
+            is already open; nothing is written.
+    """
+    area = _areaOf(request)
+    area_store = storeFor(area)
+    template = _recurringOf(request, area_store.loadRecurring())
+    if template.wait_for_completion and recurring.openCopies(area_store.loadTasks())[template.id]:
+        raise FormError(f'{template.title!r} already has an open copy; finish it, or delay it to now')
 
     now = datetime.now(UTC)
-    recurring.spawnNow(area, template.id, now)
+    recurring.pullAhead(area, template.id, now)
+    runPlan(area, now)
+    return _redirect(_returnTo(request, area))
+
+
+def _setNextDue(request: _Request) -> _Response:
+    """Hand-set an interval template's next occurrence; the rhythm continues from that day.
+
+    Raises:
+        FormError: the template does not exist, runs on anchor days, or the date does not
+            parse; nothing is written.
+    """
+    area = _areaOf(request)
+    area_store = storeFor(area)
+    templates = area_store.loadRecurring()
+    template = _recurringOf(request, templates)
+    if template.every_days is None:
+        raise FormError(f'{template.title!r} runs on anchor days; change its days to realign it')
+
+    templates[template.id] = replace(template, next_due=_requireDateField(request.form, 'next_due'))
+    area_store.saveRecurring(templates)
+    return _redirect(_returnTo(request, area))
+
+
+def _delayToNow(request: _Request) -> _Response:
+    """Merge the template's open copies into one dated today, restart its clock, re-plan.
+
+    Raises:
+        FormError: the template does not exist; nothing is written.
+    """
+    area = _areaOf(request)
+    template = _recurringOf(request, storeFor(area).loadRecurring())
+
+    now = datetime.now(UTC)
+    recurring.delayToNow(area, template.id, now)
     runPlan(area, now)
     return _redirect(_returnTo(request, area))
 
@@ -421,6 +609,21 @@ def _saveWindows(request: _Request) -> _Response:
     return _restartResponse(_returnTo(request, area))
 
 
+def _saveAreaColor(request: _Request) -> _Response:
+    """Write this area's calendar color into loom.toml, then restart so CONFIG reloads.
+
+    Raises:
+        FormError: the color is not "#rrggbb"; nothing is written.
+    """
+    area = _areaOf(request)
+    try:
+        saveAreaColor(area, _requireField(request.form, 'color'))
+    except ConfigError as exc:
+        raise FormError(str(exc)) from exc
+
+    return _restartResponse(_returnTo(request, area))
+
+
 def _savePalette(request: _Request) -> _Response:
     """Write the [palette] presets into loom.toml, then restart so CONFIG reloads.
 
@@ -435,18 +638,103 @@ def _savePalette(request: _Request) -> _Response:
     return _restartResponse(_returnTo(request, _areaOf(request)))
 
 
-def _saveKeywords(request: _Request) -> _Response:
-    """Write the [colors] keyword table into loom.toml, then restart so CONFIG reloads.
+def _saveCategories(request: _Request) -> _Response:
+    """Write the [categories] rule table into loom.toml, then restart so CONFIG reloads.
 
     Raises:
-        FormError: a line is not "keyword #rrggbb"; nothing is written.
+        FormError: a line is not "pattern -> Category", the regex does not compile, or
+            the category is not a palette name; nothing is written.
     """
     try:
-        saveKeywordColors(_colorLines(request.form, 'colors'))
+        saveCategoryRules(_ruleLines(request.form, 'categories'))
     except ConfigError as exc:
         raise FormError(str(exc)) from exc
 
     return _restartResponse(_returnTo(request, _areaOf(request)))
+
+
+def _addNewArea(request: _Request) -> _Response:
+    """Append a new [areas.<name>] table to loom.toml, then restart so CONFIG reloads.
+
+    Raises:
+        FormError: the name is malformed, reserved, or taken, or the color is not
+            "#rrggbb"; nothing is written.
+    """
+    name = _requireField(request.form, 'name').strip().lower()
+    try:
+        saveNewArea(name, _requireField(request.form, 'color').strip())
+    except ConfigError as exc:
+        raise FormError(str(exc)) from exc
+
+    # land on the new area's settings page, where its hours can be tightened
+    return _restartResponse(f'/{name}/settings?saved=1')
+
+
+def _saveAreaOrder(request: _Request) -> _Response:
+    """Save the switcher order from a drag and drop, then return to the page; no restart.
+
+    Raises:
+        FormError: a name is not an area, is hidden, or repeats; nothing is written.
+    """
+    names = [Area(name) for name in _requireField(request.form, 'order').split(',') if name]
+    try:
+        saveAreaOrder(names)
+    except ConfigError as exc:
+        raise FormError(str(exc)) from exc
+
+    return _redirect(_returnTo(request, _areaOf(request)))
+
+
+def _finishArea(request: _Request) -> _Response:
+    """Mark this area finished in loom.toml, then restart on the home area, or another open one.
+
+    Raises:
+        FormError: this is the last open area; nothing is written.
+    """
+    area = _areaOf(request)
+    try:
+        saveAreaFinished(area, datetime.now(UTC).astimezone(CONFIG.timezone).date())
+    except ConfigError as exc:
+        raise FormError(str(exc)) from exc
+
+    # land on home, else a switcher area before a hidden one
+    still_open = sorted((other for other in openAreas() if other != area), key=lambda other: CONFIG.areas[other].hidden)
+    landing = HOME_AREA if HOME_AREA in still_open else still_open[0]
+    return _restartResponse(f'/{landing}/tasks')
+
+
+def _reopenArea(request: _Request) -> _Response:
+    """Clear this area's finished date in loom.toml, then restart and land on it.
+
+    Raises:
+        FormError: the area vanished from loom.toml; nothing is written.
+    """
+    area = _areaOf(request)
+    try:
+        saveAreaFinished(area, None)
+    except ConfigError as exc:
+        raise FormError(str(exc)) from exc
+
+    return _restartResponse(f'/{area}/tasks')
+
+
+def _ruleLines(form: dict[str, str], key: str) -> list[tuple[str, str]]:
+    """Split a textarea of 'pattern -> Category' lines into (pattern, category) pairs.
+
+    Raises:
+        FormError: a line has no ' -> ' to split on.
+    """
+    entries = []
+    for line in form.get(key, '').splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pattern, separator, category = stripped.rpartition(' -> ')
+        if not separator or not pattern.strip() or not category.strip():
+            raise FormError(f'{stripped!r} is not "pattern -> Category"')
+        entries.append((pattern.strip(), category.strip()))
+
+    return entries
 
 
 def _colorLines(form: dict[str, str], key: str) -> list[tuple[str, str]]:
@@ -469,12 +757,21 @@ def _colorLines(form: dict[str, str], key: str) -> list[tuple[str, str]]:
 
 
 def _restartResponse(target: str) -> _Response:
+    """The page shown while the server re-executes itself, then the target once it is back.
+
+    Everything it needs is inline: the server goes down right after sending it, so a
+    linked stylesheet would fail to load and leave a bare white page. It polls until the
+    server answers instead of refreshing blindly into the browser's white error page;
+    the meta refresh sits in <noscript>, so it only covers a browser without scripts.
+    """
     body = (
         f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>loom: restarting</title>'
-        f'<meta http-equiv="refresh" content="2;url={esc(target)}">'
-        f'<link rel="stylesheet" href="/static/style.css"></head><body><main>'
+        f'<meta name="color-scheme" content="dark">'
+        f'<noscript><meta http-equiv="refresh" content="3;url={esc(target)}"></noscript>'
+        f'<style>{_RESTART_STYLE}</style></head><body><main>'
         f'<div class="banner"><strong>Saved.</strong> Restarting the server with the new config&hellip; '
-        f'<a href="{esc(target)}">continue</a></div></main></body></html>'
+        f'<a href="{esc(target)}">continue</a></div></main>'
+        f'<script>{_RESTART_POLL.replace("TARGET", json.dumps(target))}</script></body></html>'
     )
     return _Response(status=200, body=body, content_type=_HTML, location=None, restart=True)
 
@@ -543,9 +840,26 @@ def _editTask(request: _Request) -> _Response:
         auto_schedule='auto_schedule' in request.form,
         completed=completed,
         color=_colorField(request.form, task),
+        not_before=_notBeforeField(request.form),
     )
     area_store.saveTasks(tasks)
     runPlan(area, now)
+    return _redirect(_returnTo(request, area))
+
+
+def _toggleOrder(request: _Request) -> _Response:
+    """Flip the area between deadline-first and shortest-first, then re-plan in that order."""
+    area = _areaOf(request)
+    area_store = storeFor(area)
+    preferences = area_store.loadPreferences()
+    match preferences.order:
+        case TaskOrder.DEADLINE:
+            flipped = TaskOrder.SHORTEST
+        case TaskOrder.SHORTEST:
+            flipped = TaskOrder.DEADLINE
+
+    area_store.savePreferences(replace(preferences, order=flipped))
+    runPlan(area, datetime.now(UTC))
     return _redirect(_returnTo(request, area))
 
 
@@ -562,8 +876,34 @@ def _tickTask(request: _Request) -> _Response:
     return _redirect(_returnTo(request, area))
 
 
+def _reopenTask(request: _Request) -> _Response:
+    area = _areaOf(request)
+    area_store = storeFor(area)
+    tasks = area_store.loadTasks()
+    task = _taskOf(request, tasks)
+
+    tasks[task.id] = replace(task, status=Status.TODO, completed=None)
+    area_store.saveTasks(tasks)
+    runPlan(area, datetime.now(UTC))
+    return _redirect(_returnTo(request, area))
+
+
+def _toggleAuto(request: _Request) -> _Response:
+    area = _areaOf(request)
+    area_store = storeFor(area)
+    tasks = area_store.loadTasks()
+    task = _taskOf(request, tasks)
+
+    tasks[task.id] = replace(task, auto_schedule=not task.auto_schedule)
+    area_store.saveTasks(tasks)
+    runPlan(area, datetime.now(UTC))
+    return _redirect(_returnTo(request, area))
+
+
 def _setEstimate(request: _Request) -> _Response:
-    """Change one task's estimate (the calendar's drag-resize posts here), then re-plan.
+    """Change one task's estimate, then re-plan; an empty value clears the estimate.
+
+    The tree's inline minutes field and the calendar's drag-resize both post here.
 
     Raises:
         FormError: the task does not exist or the minutes are not a positive number.
@@ -574,9 +914,6 @@ def _setEstimate(request: _Request) -> _Response:
     task = _taskOf(request, tasks)
 
     minutes = _optionalIntField(request.form, 'estimate_minutes')
-    if minutes is None:
-        raise FormError('estimate_minutes is required')
-
     tasks[task.id] = replace(task, estimate_minutes=minutes)
     area_store.saveTasks(tasks)
     runPlan(area, datetime.now(UTC))
@@ -744,6 +1081,14 @@ def _recurringOf(request: _Request, templates: dict[RecurringId, RecurringTask])
     return template
 
 
+def _stepOf(request: _Request, steps: dict[StepId, RecurringStep]) -> RecurringStep:
+    step = steps.get(StepId(request.match.group('id')))
+    if step is None:
+        raise FormError(f'recurring step {request.match.group("id")} does not exist')
+
+    return step
+
+
 def _optionalGoalField(form: dict[str, str]) -> GoalId | None:
     text = form.get('goal', '').strip()
     return GoalId(text) if text else None
@@ -811,7 +1156,7 @@ def _returnTo(request: _Request, area: Area) -> str:
     if target.startswith('/') and not target.startswith('//'):
         return target
 
-    return f'/{area.value}/calendar'
+    return f'/{area}/calendar'
 
 
 def _weekMonday(text: str | None, now: datetime) -> date:
@@ -877,6 +1222,22 @@ def _optionalDateField(form: dict[str, str], key: str) -> date | None:
     return _requireDateField(form, key)
 
 
+def _notBeforeField(form: dict[str, str]) -> datetime | None:
+    """The edit form's not-before day and optional time, read as local wall-clock.
+
+    An empty day clears it; an empty time means the start of that day.
+
+    Raises:
+        FormError: the day or the time does not parse.
+    """
+    day = _optionalDateField(form, 'not_before_day')
+    if day is None:
+        return None
+
+    clock = _clockField(form, 'not_before_time') if form.get('not_before_time', '').strip() else time(0)
+    return datetime.combine(day, clock, tzinfo=CONFIG.timezone).astimezone(UTC)
+
+
 def _clockField(form: dict[str, str], key: str) -> time:
     text = _requireField(form, key)
     try:
@@ -904,6 +1265,7 @@ def _redirect(location: str) -> _Response:
 def _errorPage(status: int, heading: str, message: str) -> _Response:
     body = (
         f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>loom: {status}</title>'
+        f'<meta name="color-scheme" content="dark">'
         f'<link rel="stylesheet" href="/static/style.css"></head><body><main>'
         f'<div class="banner warn"><strong>{esc(heading)}</strong><p>{esc(message)}</p>'
         f'<p><a href="/">back to the calendar</a></p></div></main></body></html>'
@@ -911,30 +1273,44 @@ def _errorPage(status: int, heading: str, message: str) -> _Response:
     return _Response(status=status, body=body, content_type=_HTML, location=None)
 
 
-_AREA = f'(?P<area>{"|".join(area.value for area in Area)})'
+_AREA = f'(?P<area>{"|".join(CONFIG.areas)})'
 _ROUTES: tuple[_Route, ...] = (
     ('GET', re.compile(r'^/$'), _home),
     ('GET', re.compile(r'^/static/(?P<name>[a-z_.]+)$'), _static),
     ('GET', re.compile(f'^/{_AREA}/calendar$'), _calendarPage),
     ('GET', re.compile(f'^/{_AREA}/tasks$'), _tasksPage),
     ('GET', re.compile(f'^/{_AREA}/deadlines$'), _deadlinesPage),
+    ('GET', re.compile(f'^/{_AREA}/achievements$'), _achievementsPage),
     ('GET', re.compile(f'^/{_AREA}/recurring$'), _recurringPage),
     ('POST', re.compile(f'^/{_AREA}/recurring/add$'), _addRecurring),
     ('POST', re.compile(f'^/{_AREA}/recurring/(?P<id>[a-z0-9_]+)/edit$'), _editRecurring),
     ('POST', re.compile(f'^/{_AREA}/recurring/(?P<id>[a-z0-9_]+)/delete$'), _deleteRecurring),
-    ('POST', re.compile(f'^/{_AREA}/recurring/(?P<id>[a-z0-9_]+)/spawn$'), _spawnRecurring),
+    ('POST', re.compile(f'^/{_AREA}/recurring/(?P<id>[a-z0-9_]+)/pull-ahead$'), _pullAhead),
+    ('POST', re.compile(f'^/{_AREA}/recurring/(?P<id>[a-z0-9_]+)/delay$'), _delayToNow),
+    ('POST', re.compile(f'^/{_AREA}/recurring/(?P<id>[a-z0-9_]+)/next$'), _setNextDue),
+    ('POST', re.compile(f'^/{_AREA}/recurring/(?P<id>[a-z0-9_]+)/steps/add$'), _addStep),
+    ('POST', re.compile(f'^/{_AREA}/recurring/steps/(?P<id>[a-z0-9_]+)/edit$'), _editStep),
+    ('POST', re.compile(f'^/{_AREA}/recurring/steps/(?P<id>[a-z0-9_]+)/delete$'), _deleteStep),
     ('GET', re.compile(f'^/{_AREA}/settings$'), _settingsPage),
     ('POST', re.compile(f'^/{_AREA}/settings/windows$'), _saveWindows),
+    ('POST', re.compile(f'^/{_AREA}/settings/color$'), _saveAreaColor),
     ('POST', re.compile(f'^/{_AREA}/settings/palette$'), _savePalette),
-    ('POST', re.compile(f'^/{_AREA}/settings/colors$'), _saveKeywords),
+    ('POST', re.compile(f'^/{_AREA}/settings/categories$'), _saveCategories),
+    ('POST', re.compile(f'^/{_AREA}/areas/add$'), _addNewArea),
+    ('POST', re.compile(f'^/{_AREA}/areas/order$'), _saveAreaOrder),
+    ('POST', re.compile(f'^/{_AREA}/area/finish$'), _finishArea),
+    ('POST', re.compile(f'^/{_AREA}/area/reopen$'), _reopenArea),
     ('POST', re.compile(f'^/{_AREA}/goals/add$'), _addGoal),
     ('POST', re.compile(f'^/{_AREA}/goals/(?P<id>[a-z0-9_]+)/edit$'), _editGoal),
     ('POST', re.compile(f'^/{_AREA}/goals/(?P<id>[a-z0-9_]+)/move$'), _moveGoal),
     ('POST', re.compile(f'^/{_AREA}/goals/(?P<id>[a-z0-9_]+)/finish$'), _finishGoal),
     ('POST', re.compile(f'^/{_AREA}/goals/(?P<id>[a-z0-9_]+)/reopen$'), _reopenGoal),
     ('POST', re.compile(f'^/{_AREA}/tasks/add$'), _addTask),
+    ('POST', re.compile(f'^/{_AREA}/tasks/order$'), _toggleOrder),
     ('POST', re.compile(f'^/{_AREA}/tasks/(?P<id>[a-z0-9_]+)/edit$'), _editTask),
     ('POST', re.compile(f'^/{_AREA}/tasks/(?P<id>[a-z0-9_]+)/tick$'), _tickTask),
+    ('POST', re.compile(f'^/{_AREA}/tasks/(?P<id>[a-z0-9_]+)/reopen$'), _reopenTask),
+    ('POST', re.compile(f'^/{_AREA}/tasks/(?P<id>[a-z0-9_]+)/auto$'), _toggleAuto),
     ('POST', re.compile(f'^/{_AREA}/tasks/(?P<id>[a-z0-9_]+)/estimate$'), _setEstimate),
     ('POST', re.compile(f'^/{_AREA}/tasks/(?P<id>[a-z0-9_]+)/delete$'), _deleteTask),
     ('POST', re.compile(f'^/{_AREA}/tasks/(?P<id>[a-z0-9_]+)/deps/add$'), _addDependency),

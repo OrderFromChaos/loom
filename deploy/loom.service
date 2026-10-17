@@ -1,0 +1,29 @@
+# Keep loom serving from login on at http://127.0.0.1:8321/ (lands on the work area).
+# The server also spawns due recurring copies every five minutes, page open or not.
+#
+# Install once:      systemctl --user link "$PWD/deploy/loom.service"
+#                    systemctl --user enable --now loom
+# After code edits:  systemctl --user restart loom
+# Status and logs:   systemctl --user status loom
+#                    journalctl --user -u loom -f
+# Remove:            systemctl --user disable --now loom
+#
+# Saving settings in the UI restarts loom in place (exec), which systemd sees as the
+# same running service. A malformed loom.toml exits with status 2; that is not retried,
+# since restarting cannot fix it: correct the file, then restart.
+
+[Unit]
+Description=loom task planner (local web UI)
+
+[Service]
+WorkingDirectory=%h/Dropbox/OrderedSetCode/hierarchy-task
+ExecStart=%h/.local/bin/uv run loom serve
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2
+# uv reports a child stopped by systemd's SIGTERM as 143 (128 + 15): a clean stop
+SuccessExitStatus=143
+
+[Install]
+WantedBy=default.target

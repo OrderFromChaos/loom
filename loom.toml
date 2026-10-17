@@ -20,15 +20,29 @@ scroll_start = "08:00"  # where the grid is scrolled to on page load
 [areas.work]
 windows = ["Mon-Fri 10:00-17:00"]
 color = "#58a6ff"
+order = 1
 
 [areas.personal]
 windows = ["Mon-Fri 12:30-13:30", "Mon-Fri 17:00-23:59", "Sat 09:00-23:59", "Sun 09:00-23:59"]
 color = "#3fb950"
+order = 2
 
-# Sample data lives here; the real areas stay clean.
+[areas.zed]
+windows = ["Mon-Sun 09:00-21:00"]
+color = "#e3b341"
+finished = 2026-10-16
+
+# Sample data lives here; the real areas stay clean. Hidden: off the switcher, and
+# reached from its + menu.
 [areas.demo]
 windows = ["Mon-Sun 09:00-21:00"]
 color = "#8957e5"
+hidden = true
+
+[areas.plannh]
+windows = ["Mon-Sun 09:00-21:00"]
+color = "#250dd3"
+order = 3
 
 # Named color presets a task can be set to directly (task edit panel, "color").
 # Renaming or recoloring a preset here recolors every task pointing at it.
@@ -41,7 +55,7 @@ Projects = "#335c67"
 Urgent = "#eceff1"
 Health = "#5c8001"
 
-# Calendar block colors by task title: case-insensitive substring match,
-# first match in file order wins, no match falls back to the area color.
-# A task's manual palette color, when set, wins over these keywords.
-[colors]
+# Automatic category by title: Python regex (case-insensitive), first match wins.
+# The category must be a palette name above; its color follows the palette.
+# A task's manually set category wins over these rules.
+[categories]
