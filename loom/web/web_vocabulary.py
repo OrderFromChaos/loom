@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from http import HTTPStatus
+
+from loom.vocabulary import Area
 
 
 class View(Enum):
@@ -37,3 +42,23 @@ class MoveDirection(Enum):
 
 class FormError(RuntimeError):
     """A submitted form field is absent or malformed."""
+
+
+@dataclass(frozen=True)
+class Request:
+    match: re.Match[str]
+    query: Mapping[str, str]
+    form: Mapping[str, str]
+    home_area: Area  # where GET / redirects, from the command line
+
+
+@dataclass(frozen=True)
+class Response:
+    status: HTTPStatus
+    body: str | bytes
+    content_type: str
+    location: str | None
+    restart: bool = False  # after sending: exec a fresh server so CONFIG reloads
+
+
+RouteHandler = Callable[[Request], Response]

@@ -2,7 +2,7 @@
 
 Run from the project root, where loom.toml lives:
 
-    $ uv run loom serve              # the web UI; / lands on the work area
+    $ uv run loom serve              # the web UI. / redirects to the work area
     $ uv run loom serve --area demo  # / lands on the demo area instead
     $ uv run loom serve --port 8322  # a second instance beside the always-on one
     $ uv run loom plan               # re-plan every area and print each result
@@ -23,7 +23,7 @@ Modules in reading order:
     recurring   templates that stamp out real tasks on a cadence
     triage      staleness and deadline pressure, derived at read time
     coloring    category rules -> calendar color
-    web         the local web UI: server, pages, geometry, static files
+    web         the local web UI: server, routes, pages, geometry, static files
 
 Exit codes:
     0  success, and for check, no problems found
