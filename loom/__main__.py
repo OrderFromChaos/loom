@@ -2,30 +2,31 @@
 
 Run from the project root, where loom.toml lives:
 
-    $ uv run loom serve              # the web UI; / lands on the work area
+    $ uv run loom serve              # the web UI. / redirects to the work area
     $ uv run loom serve --area demo  # / lands on the demo area instead
     $ uv run loom serve --port 8322  # a second instance beside the always-on one
     $ uv run loom plan               # re-plan every area and print each result
     $ uv run loom check              # report integrity problems in the data files
 
-deploy/loom.service runs `loom serve` as a systemd user service from login on; its
+deploy/loom.service runs `loom serve` as a systemd user service from login on. Its
 header has the install, restart and log commands.
 
 Modules in reading order:
 
     vocabulary  every shared type
     config      loom.toml -> the frozen CONFIG singleton
+    live_config loom.toml as it is on disk now, and its in-place edits
     store       reading and writing one area's data files
-    graph       hierarchy walks, dependency blocking, actionability
+    graph       hierarchy walks, dependency blocking, integrity problems
     timemap     weekly windows -> concrete free UTC slots
     scheduler   candidate selection and greedy placement
     recurring   templates that stamp out real tasks on a cadence
     triage      staleness and deadline pressure, derived at read time
-    coloring    keyword -> calendar color
-    web         the local web UI: server, pages, geometry, static files
+    coloring    category rules -> calendar color
+    web         the local web UI: server, routes, pages, geometry, static files
 
 Exit codes:
-    0  success; for check, no problems found
+    0  success, and for check, no problems found
     1  check found problems, or a data file failed to parse
     2  the command line or loom.toml was unusable
 """
@@ -36,6 +37,7 @@ import argparse
 import logging
 import sys
 from datetime import UTC, datetime
+from enum import Enum
 
 from loom.vocabulary import Area, ConfigError, StoreError
 
@@ -57,23 +59,26 @@ def main() -> int:
         Nothing: config and data failures become messages and exit codes 2 and 1.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('command', choices=('serve', 'plan', 'check'))
-    # the valid names live in loom.toml, which only loads inside the try below
-    parser.add_argument('--area', default='work', help='the area / lands on')
-    parser.add_argument('--port', type=int, default=None, help='listen here instead of [web] port in loom.toml')
+    parser.add_argument('command', choices=[command.value for command in Command])
+    # loom.toml has the valid names, and it loads only inside the try below
+    parser.add_argument('--area', default='work', help='the area that / redirects to')
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=None,
+        help='the port to listen on (default: [web] port in loom.toml)',
+    )
     args = parser.parse_args()
     configureLogging()
 
     try:
-        match args.command:
-            case 'serve':
+        match Command(args.command):
+            case Command.SERVE:
                 return servePages(Area(args.area), args.port)
-            case 'plan':
+            case Command.PLAN:
                 return printPlans()
-            case 'check':
+            case Command.CHECK:
                 return reportProblems()
-            case _:
-                parser.error(f'unknown command {args.command!r}')
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return EXIT_BAD_SETUP
@@ -91,24 +96,23 @@ def configureLogging() -> None:
 
 
 def servePages(home: Area, port: int | None) -> int:
-    # imported inside the command: loom.config parses loom.toml at import time, and a
-    # malformed config should print one line and exit 2, not die in an import traceback
+    # loom.config parses loom.toml at import. Import it inside the command, so a malformed
+    # config prints one line and exits 2
     from loom.config import CONFIG
     from loom.web import server
 
     if home not in CONFIG.areas:
-        raise ConfigError(f'--area {home!r} is not in loom.toml; areas: {", ".join(CONFIG.areas)}')
+        raise ConfigError(f'--area {home!r} is not in loom.toml. Areas: {", ".join(CONFIG.areas)}')
 
     return server.serveForever(home, port if port is not None else CONFIG.web.port)
 
 
 def printPlans() -> int:
-    from loom import recurring, scheduler
-    from loom.config import openAreas
+    from loom import config, recurring, scheduler
 
     now = datetime.now(UTC)
-    for area in openAreas():
-        spawned = recurring.spawnDue(area, now)
+    for area in config.listOpenAreas():
+        spawned = recurring.spawnDueCopies(area, now)
         if spawned:
             print(f'{area}: {spawned} recurring task(s) spawned')
         plan = scheduler.runPlan(area, now)
@@ -120,14 +124,13 @@ def printPlans() -> int:
 
 
 def reportProblems() -> int:
+    from loom import graph, store
     from loom.config import CONFIG
-    from loom.graph import checkIntegrity
-    from loom.store import storeFor
 
     total = 0
     for area in CONFIG.areas:
-        area_store = storeFor(area)
-        problems = checkIntegrity(area_store.loadTasks(), area_store.loadGoals())
+        area_store = store.openStore(area)
+        problems = graph.listIntegrityProblems(area_store.loadTasks(), area_store.loadGoals())
         for problem in problems:
             print(f'{area}: {problem}')
         total += len(problems)
@@ -137,6 +140,12 @@ def reportProblems() -> int:
 
 
 ### vocabulary #########################################################################
+
+
+class Command(Enum):
+    SERVE = 'serve'
+    PLAN = 'plan'
+    CHECK = 'check'
 
 
 class FieldFormatter(logging.Formatter):

@@ -1,8 +1,8 @@
 """Time-derived readings over tasks, plans and events: staleness and deadline pressure.
 
-Nothing here is stored; both readings are recomputed from the plan record and the event
-log on every call. Re-planning does not clear staleness, because the record of what was
-promised lives in plan_history.jsonl; logging work on the task or acknowledging it does.
+Each call recomputes its reading, and nothing is stored. Re-planning does not clear
+staleness, because the promised blocks are in plan_history.jsonl. A did event or an ack
+for the task clears it.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta
 
-from loom import graph
+from loom import config, graph
 from loom.config import CONFIG
 from loom.vocabulary import (
     DeadlineEntry,
@@ -25,9 +25,9 @@ from loom.vocabulary import (
 )
 
 
-def overdueTaskIds(tasks: Mapping[TaskId, Task], now: datetime) -> frozenset[TaskId]:
-    """Open tasks whose deadline day has ended: what the pages currently call stale."""
-    today = now.astimezone(CONFIG.timezone).date()
+def collectOverdueTaskIds(tasks: Mapping[TaskId, Task], now: datetime) -> frozenset[TaskId]:
+    """Collect the open tasks whose deadline day has ended."""
+    today = config.computeLocalDate(now)
     return frozenset(
         task.id
         for task in tasks.values()
@@ -35,27 +35,28 @@ def overdueTaskIds(tasks: Mapping[TaskId, Task], now: datetime) -> frozenset[Tas
     )
 
 
-def staleTaskIds(
+def collectStaleTaskIds(
     tasks: Mapping[TaskId, Task],
     plan: Plan | None,
     history: Iterable[PlanBlock],
     events: Iterable[LoggedEvent],
     now: datetime,
 ) -> frozenset[TaskId]:
-    """Open tasks whose latest passed block (plus grace) has no touch at or after it.
+    """Collect the open tasks whose latest passed block, plus grace, has no touch at or after it.
 
-    A touch is a 'did' event for the task (at its end time), an 'ack' for it, or the
-    task's completion timestamp.
+    A touch is a 'did' event for the task at its end time, an 'ack' for it, or the task's
+    completion timestamp.
     """
     grace = timedelta(minutes=CONFIG.scheduler.stale_grace_minutes)
     plan_blocks = plan.blocks if plan is not None else ()
 
     promised: dict[TaskId, datetime] = {}
     for block in (*plan_blocks, *history):
-        if block.end + grace <= now:
-            recorded = promised.get(block.task)
-            if recorded is None or block.end > recorded:
-                promised[block.task] = block.end
+        if block.end + grace > now:
+            continue
+        recorded = promised.get(block.task)
+        if recorded is None or block.end > recorded:
+            promised[block.task] = block.end
 
     touches: dict[TaskId, datetime] = {}
     for event in events:
@@ -80,26 +81,26 @@ def staleTaskIds(
     return frozenset(stale)
 
 
-def deadlineTasks(
+def listDeadlineEntries(
     tasks: Mapping[TaskId, Task],
     goals: Mapping[GoalId, Goal],
     plan: Plan | None,
     now: datetime,
 ) -> tuple[DeadlineEntry, ...]:
-    """Every open task carrying a deadline, soonest first."""
-    today = now.astimezone(CONFIG.timezone).date()
-    blocked = graph.dependencyBlocked(tasks)
+    """List an entry for every open task with a deadline, sorted by (deadline, priority, id)."""
+    today = config.computeLocalDate(now)
+    blocked = graph.collectDependencyBlockedIds(tasks)
 
     minutes_planned: dict[TaskId, int] = {}
     for block in plan.blocks if plan is not None else ():
-        block_minutes = int((block.end - block.start).total_seconds() // 60)
+        block_minutes = (block.end - block.start) // timedelta(minutes=1)
         minutes_planned[block.task] = minutes_planned.get(block.task, 0) + block_minutes
 
     entries = []
     for task in tasks.values():
         if task.deadline is None or not graph.stillOpen(task):
             continue
-        goal_id = graph.effectiveGoal(task, tasks)
+        goal_id = graph.findEffectiveGoal(task, tasks)
         entries.append(
             DeadlineEntry(
                 task=task,
@@ -110,5 +111,7 @@ def deadlineTasks(
             ),
         )
 
-    entries.sort(key=lambda entry: (entry.task.deadline or date.max, entry.task.priority.rank(), entry.task.id))
+    entries.sort(
+        key=lambda entry: (entry.task.deadline or date.max, entry.task.priority.computeSortRank(), entry.task.id),
+    )
     return tuple(entries)

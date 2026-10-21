@@ -32,38 +32,38 @@ from loom.vocabulary import (
 )
 
 
-def _taskIds() -> st.SearchStrategy[TaskId]:
+def _buildTaskIdStrategy() -> st.SearchStrategy[TaskId]:
     return st.from_regex(r't_[a-z2-7]{8}', fullmatch=True).map(TaskId)
 
 
-def _goalIds() -> st.SearchStrategy[GoalId]:
+def _buildGoalIdStrategy() -> st.SearchStrategy[GoalId]:
     return st.from_regex(r'g_[a-z2-7]{8}', fullmatch=True).map(GoalId)
 
 
-def _utcTimestamps() -> st.SearchStrategy[datetime]:
+def _buildTimestampStrategy() -> st.SearchStrategy[datetime]:
     return st.datetimes(min_value=datetime(2020, 1, 1), max_value=datetime(2035, 1, 1), timezones=st.just(UTC))
 
 
-def _tasks() -> st.SearchStrategy[Task]:
+def _buildTaskStrategy() -> st.SearchStrategy[Task]:
     return st.builds(
         Task,
-        id=_taskIds(),
+        id=_buildTaskIdStrategy(),
         title=st.text(max_size=40),
         status=st.sampled_from(Status),
-        parent=st.none() | _taskIds(),
-        goal=st.none() | _goalIds(),
-        blocked_by=st.lists(_taskIds(), max_size=3, unique=True).map(tuple),
+        parent=st.none() | _buildTaskIdStrategy(),
+        goal=st.none() | _buildGoalIdStrategy(),
+        blocked_by=st.lists(_buildTaskIdStrategy(), max_size=3, unique=True).map(tuple),
         notes=st.text(max_size=40),
         estimate_minutes=st.none() | st.integers(min_value=1, max_value=600),
         deadline=st.none() | st.dates(min_value=date(2020, 1, 1), max_value=date(2035, 1, 1)),
         auto_schedule=st.booleans(),
         priority=st.sampled_from(Priority),
-        created=_utcTimestamps(),
-        completed=st.none() | _utcTimestamps(),
+        created=_buildTimestampStrategy(),
+        completed=st.none() | _buildTimestampStrategy(),
     )
 
 
-def _didEvents() -> st.SearchStrategy[LoggedEvent]:
+def _buildDidEventStrategy() -> st.SearchStrategy[LoggedEvent]:
     """Generate 'did' events whose end always follows their start, as the parse gate requires."""
 
     def build(
@@ -93,15 +93,15 @@ def _didEvents() -> st.SearchStrategy[LoggedEvent]:
     return st.builds(
         build,
         event_id=st.from_regex(r'e_[a-z2-7]{8}', fullmatch=True).map(EventId),
-        at=_utcTimestamps(),
-        start=_utcTimestamps(),
+        at=_buildTimestampStrategy(),
+        start=_buildTimestampStrategy(),
         minutes=st.integers(min_value=1, max_value=600),
         note=st.text(max_size=40),
-        task=st.none() | _taskIds(),
+        task=st.none() | _buildTaskIdStrategy(),
     )
 
 
-@given(task_list=st.lists(_tasks(), max_size=8, unique_by=lambda task: task.id))
+@given(task_list=st.lists(_buildTaskStrategy(), max_size=8, unique_by=lambda task: task.id))
 def testTasksSurviveASaveLoadRoundTrip(task_list: list[Task]) -> None:
     tasks = {task.id: task for task in task_list}
     with tempfile.TemporaryDirectory() as temp:
@@ -112,11 +112,11 @@ def testTasksSurviveASaveLoadRoundTrip(task_list: list[Task]) -> None:
 @given(
     goals=st.builds(
         Goal,
-        id=_goalIds(),
+        id=_buildGoalIdStrategy(),
         title=st.text(max_size=40),
         notes=st.text(max_size=40),
-        created=_utcTimestamps(),
-        completed=st.none() | _utcTimestamps(),
+        created=_buildTimestampStrategy(),
+        completed=st.none() | _buildTimestampStrategy(),
         position=st.none() | st.integers(min_value=1, max_value=50),
     ).map(lambda goal: {goal.id: goal}),
 )
@@ -126,7 +126,7 @@ def testGoalsSurviveASaveLoadRoundTrip(goals: dict[GoalId, Goal]) -> None:
         assert Store(Path(temp)).loadGoals() == goals
 
 
-@given(events=st.lists(_didEvents(), max_size=6))
+@given(events=st.lists(_buildDidEventStrategy(), max_size=6))
 def testEventsSurviveAppendsAndAReload(events: list[LoggedEvent]) -> None:
     with tempfile.TemporaryDirectory() as temp:
         writer = Store(Path(temp))

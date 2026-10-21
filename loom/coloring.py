@@ -1,7 +1,7 @@
 """Pick a calendar color: manual category first, then category rules, then the area.
 
-A category is a palette preset; its hex lives in loom.toml, so recoloring a category
-recolors everything assigned to it, manually or by rule. Stored data carries at most a
+A category is a palette preset, and its hex is in loom.toml. Recoloring a category
+recolors everything assigned to it, manually or by rule. A task record has at most a
 category name.
 """
 
@@ -11,19 +11,19 @@ from loom.config import CONFIG
 from loom.vocabulary import Area, Color, Task
 
 
-def colorForTask(task: Task, area: Area) -> Color:
-    """The task's manual category when set and known; otherwise the title rules."""
+def pickTaskColor(task: Task, area: Area) -> Color:
+    """Pick the color of the task's manual category when it is set and known, otherwise pickTitleColor()."""
     if task.color is not None:
         preset = CONFIG.palette.get(task.color)
         if preset is not None:
             return preset
 
-    return colorForTitle(task.title, area)
+    return pickTitleColor(task.title, area)
 
 
-def colorForTitle(title: str, area: Area) -> Color:
-    """The first [categories] rule whose regex matches decides; no match, area color."""
-    category = categoryForTitle(title)
+def pickTitleColor(title: str, area: Area) -> Color:
+    """Pick the color of the first [categories] rule that matches the title, otherwise the area color."""
+    category = _findTitleCategory(title)
     if category is not None:
         preset = CONFIG.palette.get(category)
         if preset is not None:
@@ -32,8 +32,7 @@ def colorForTitle(title: str, area: Area) -> Color:
     return CONFIG.areas[area].color
 
 
-def categoryForTitle(title: str) -> str | None:
-    """The first matching rule's category name, None when no rule matches."""
+def _findTitleCategory(title: str) -> str | None:
     for rule in CONFIG.categories:
         if rule.pattern.search(title):
             return rule.category

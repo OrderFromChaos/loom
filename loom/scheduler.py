@@ -1,24 +1,24 @@
 """Choose what to schedule and place it into free time.
 
-Placement is greedy and deterministic: candidates sort by the area's chosen order (see
-schedulingKey), each fills the earliest free slot, long tasks split into chunks between
-the configured minimum and maximum. The same inputs always give a byte-identical plan.
+Placement is greedy and deterministic. Candidates sort by _computeSchedulingKey for the
+area's order, each fills the earliest free slot, and a long task splits into chunks
+between the configured minimum and maximum. A rerun on the same inputs writes a
+byte-identical plan.
 
-runPlan is the coordinator: it retires past blocks to plan_history.jsonl, re-plans the
-future from `now`, and writes plan.json. The past is never re-planned.
+runPlan retires past blocks to plan_history.jsonl, computes a new plan for the future
+from `now`, and writes plan.json. The past is never re-planned.
 """
 
 from __future__ import annotations
 
 import logging
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 
-from loom import graph, timemap
+from loom import graph, store, timemap
 from loom.config import CONFIG
-from loom.store import storeFor
 from loom.vocabulary import (
     Area,
     OrderedPlacement,
@@ -46,7 +46,7 @@ def runPlan(area: Area, now: datetime) -> Plan:
     Raises:
         StoreError: a data file of this area is unreadable or malformed.
     """
-    area_store = storeFor(area)
+    area_store = store.openStore(area)
     tasks = area_store.loadTasks()
     fixed = area_store.loadFixed()
 
@@ -56,7 +56,7 @@ def runPlan(area: Area, now: datetime) -> Plan:
 
     order = area_store.loadPreferences().order
     selection = selectCandidates(tasks, order)
-    slots = timemap.freeSlots(area, fixed, now, CONFIG.horizon_days)
+    slots = timemap.computeFreeSlots(area, fixed, now, CONFIG.horizon_days)
     # a task deferred past the horizon has nothing to place yet and nothing to report
     horizon_end = now + timedelta(days=CONFIG.horizon_days)
     in_reach = tuple(task for task in selection.candidates if task.not_before is None or task.not_before < horizon_end)
@@ -78,15 +78,15 @@ def runPlan(area: Area, now: datetime) -> Plan:
 
 
 def selectCandidates(tasks: Mapping[TaskId, Task], order: TaskOrder) -> Selection:
-    """Split flagged open tasks into placeable candidates and reported rejections.
+    """Split the auto-scheduled open tasks into placeable candidates and rejections.
 
-    Candidates come back in scheduling order for `order` (see schedulingKey).
+    Candidates sort by _computeSchedulingKey for `order`.
     """
-    blocked = graph.dependencyBlocked(tasks)
+    blocked = graph.collectDependencyBlockedIds(tasks)
 
     candidates = []
     rejected = []
-    for task in sorted(tasks.values(), key=lambda task: schedulingKey(task, order)):
+    for task in sorted(tasks.values(), key=lambda task: _computeSchedulingKey(task, order)):
         if not task.auto_schedule or task.status not in (Status.TODO, Status.IN_PROGRESS):
             continue
         if task.id in blocked:
@@ -99,6 +99,27 @@ def selectCandidates(tasks: Mapping[TaskId, Task], order: TaskOrder) -> Selectio
     return Selection(candidates=tuple(candidates), rejected=tuple(rejected))
 
 
+def _computeSchedulingKey(task: Task, order: TaskOrder) -> _SchedulingKey:
+    """Compute the placement order key. The task with the smaller key is placed first, in the earlier free time.
+
+    DEADLINE: deadlined tasks by deadline, then priority, age, id. SHORTEST: fewest
+    estimated minutes first (unestimated last), ties broken as DEADLINE.
+    """
+    by_deadline = (
+        task.deadline is None,
+        task.deadline or date.max,
+        task.priority.computeSortRank(),
+        task.created,
+        task.id,
+    )
+    match order:
+        case TaskOrder.DEADLINE:
+            return (0, *by_deadline)
+        case TaskOrder.SHORTEST:
+            minutes = task.estimate_minutes if task.estimate_minutes is not None else sys.maxsize
+            return (minutes, *by_deadline)
+
+
 def placeInOrder(
     candidates: tuple[Task, ...],
     slots: tuple[Slot, ...],
@@ -106,16 +127,17 @@ def placeInOrder(
     order: TaskOrder,
     now: datetime,
 ) -> OrderedPlacement:
-    """Place the candidates in the area's order; shortest-first goes through the ADHD buckets.
+    """Place the candidates in the area's order. Shortest-first goes through the ADHD buckets.
 
-    Shortest-first alone can starve a long task whose deadline is near. So each pass
-    places the standard ADHD ordering's buckets in turn; a deadlined task that misses
-    joins the at-risk set, which puts it in the first bucket next pass, until a pass adds
-    nobody new. The set only grows, so this ends within one pass per candidate. A task
-    that misses even when first (its deadline is already past) stays at risk.
+    Shortest-first alone can starve a long task whose deadline is near. So each pass is
+    one placement of the buckets of sortIntoBuckets, in bucket order. A task left unplaced
+    with MISSES_DEADLINE joins the at-risk set, and the next pass puts it in the first
+    bucket. The passes stop when one adds no task to the set. The set only grows, so the
+    loop ends within one pass per candidate. A task unplaced even from the first bucket,
+    because its deadline is already past, stays at risk.
 
     Raises:
-        Nothing: placement reports what did not fit instead of failing.
+        Nothing: a task that did not fit is in the returned placement's unplaced list.
     """
     match order:
         case TaskOrder.DEADLINE:
@@ -124,57 +146,19 @@ def placeInOrder(
             return _placeByBuckets(candidates, slots, now)
 
 
-def _placeByBuckets(candidates: tuple[Task, ...], slots: tuple[Slot, ...], now: datetime) -> OrderedPlacement:
-    at_risk: frozenset[TaskId] = frozenset()
-    while True:
-        queue = standardADHDOrdering(candidates, at_risk, now).placementQueue()
-        placement = placeTasks(queue, slots)
-        missed = {entry.task for entry in placement.unplaced if entry.reason is Reason.MISSES_DEADLINE}
-        if missed <= at_risk:
-            return OrderedPlacement(placement=placement, at_risk=at_risk)
-        at_risk |= missed
-
-
-def standardADHDOrdering(tasks: Iterable[Task], at_risk: frozenset[TaskId], now: datetime) -> TasksByBucket:
-    """Sort tasks into the four shortest-first buckets; the one ordering both planner and page use.
-
-    A task lands in the first bucket that claims it: unestimated, then deadline at risk
-    (which beats not-yet: a deferred task can still miss its deadline), then not-yet,
-    then quickest. `at_risk` comes from the planner's promotion passes, or from the saved
-    plan when the tasks page lists the Auto group.
-    """
-    risky, quickest, not_yet, unestimated = [], [], [], []
-    for task in tasks:
-        if task.estimate_minutes is None:
-            unestimated.append(task)
-        elif task.id in at_risk:
-            risky.append(task)
-        elif graph.notYet(task, now):
-            not_yet.append(task)
-        else:
-            quickest.append(task)
-
-    return TasksByBucket(
-        at_risk=tuple(sorted(risky, key=lambda task: schedulingKey(task, TaskOrder.DEADLINE))),
-        quickest=tuple(sorted(quickest, key=lambda task: schedulingKey(task, TaskOrder.SHORTEST))),
-        not_yet=tuple(sorted(not_yet, key=lambda task: (task.not_before or now, task.id))),
-        unestimated=tuple(unestimated),
-    )
-
-
 def placeTasks(candidates: Iterable[Task], slots: Iterable[Slot]) -> Placement:
     """Place each candidate into the earliest free time, in the given order.
 
-    A task that cannot be fully placed consumes nothing and is reported: a deadlined task
-    as MISSES_DEADLINE (half-scheduling a deadline would read as handled when it is not),
-    the rest as NO_ROOM.
+    A task that cannot be fully placed takes no time and goes to unplaced: a deadlined
+    task as MISSES_DEADLINE, the rest as NO_ROOM. A deadline scheduled by half would
+    look handled.
     """
-    free = sorted(slots, key=lambda slot: slot.start)
+    free = tuple(sorted(slots, key=lambda slot: slot.start))
 
     placed: list[PlanBlock] = []
     unplaced: list[Unplaced] = []
     for task in candidates:
-        fit = _placeOne(task, free)
+        fit = _fitTask(task, free)
         if fit.blocks is None:
             reason = Reason.MISSES_DEADLINE if task.deadline is not None else Reason.NO_ROOM
             unplaced.append(Unplaced(task=task.id, reason=reason))
@@ -186,18 +170,18 @@ def placeTasks(candidates: Iterable[Task], slots: Iterable[Slot]) -> Placement:
     return Placement(blocks=tuple(placed), unplaced=tuple(unplaced))
 
 
-def _placeOne(task: Task, free: list[Slot]) -> _Fit:
+def _fitTask(task: Task, free: Sequence[Slot]) -> _Fit:
     """Fit one task, returning its blocks and the free time left, or no blocks and `free` untouched.
 
-    A chunk shorter than min_chunk_minutes is refused unless it is the task's own tail.
-    Time before the task's not_before stays free for other tasks: a slot straddling it is
-    split, and only the part from not_before on is used.
+    A chunk shorter than min_chunk_minutes is refused unless it is the last chunk of the
+    task. Time before the task's not_before stays free for other tasks: a slot across it
+    is split, and only the part from not_before on is used.
     """
     remaining = task.estimate_minutes
     if remaining is None:
-        return _Fit(blocks=None, free_after=free)
+        return _Fit(blocks=None, free_after=tuple(free))
 
-    cutoff = _deadlineCutoff(task.deadline) if task.deadline is not None else None
+    cutoff = _computeDeadlineCutoff(task.deadline) if task.deadline is not None else None
     floor = task.not_before
     min_chunk = CONFIG.scheduler.min_chunk_minutes
     max_chunk = CONFIG.scheduler.max_chunk_minutes
@@ -212,7 +196,7 @@ def _placeOne(task: Task, free: list[Slot]) -> _Fit:
             break
 
         usable_end = min(slot.end, cutoff) if cutoff is not None else slot.end
-        available = int((usable_end - start).total_seconds() // 60)
+        available = (usable_end - start) // timedelta(minutes=1)
         chunk = min(remaining, available, max_chunk)
         if chunk <= 0 or (chunk < min_chunk and chunk < remaining):
             index += 1
@@ -228,46 +212,68 @@ def _placeOne(task: Task, free: list[Slot]) -> _Fit:
             leftover.append(Slot(start=chunk_end, end=slot.end))
         working[index : index + 1] = leftover
         if slot.start < start:
-            index += 1  # the piece before not_before is not this task's to use
+            index += 1  # the piece before not_before stays free for other tasks
 
     if remaining > 0:
-        return _Fit(blocks=None, free_after=free)
+        return _Fit(blocks=None, free_after=tuple(free))
 
-    blocks = [
+    blocks = tuple(
         PlanBlock(task=task.id, start=piece.start, end=piece.end, chunk=number, chunks=len(pieces))
         for number, piece in enumerate(pieces, start=1)
-    ]
-    return _Fit(blocks=blocks, free_after=working)
+    )
+    return _Fit(blocks=blocks, free_after=tuple(working))
 
 
-def schedulingKey(task: Task, order: TaskOrder) -> _SchedulingKey:
-    """Placement order: a smaller key places first and takes the earlier free time.
-
-    DEADLINE: deadlined tasks by deadline, then priority, age, id. SHORTEST: fewest
-    estimated minutes first (unestimated last), ties broken as DEADLINE.
-    """
-    by_deadline = (task.deadline is None, task.deadline or date.max, task.priority.rank(), task.created, task.id)
-    match order:
-        case TaskOrder.DEADLINE:
-            return (0, *by_deadline)
-        case TaskOrder.SHORTEST:
-            minutes = task.estimate_minutes if task.estimate_minutes is not None else sys.maxsize
-            return (minutes, *by_deadline)
-
-
-def _deadlineCutoff(deadline: date) -> datetime:
+def _computeDeadlineCutoff(deadline: date) -> datetime:
     day_after = datetime.combine(deadline + timedelta(days=1), time(0), tzinfo=CONFIG.timezone)
     return day_after.astimezone(UTC)
+
+
+def _placeByBuckets(candidates: tuple[Task, ...], slots: tuple[Slot, ...], now: datetime) -> OrderedPlacement:
+    at_risk: frozenset[TaskId] = frozenset()
+    while True:
+        queue = sortIntoBuckets(candidates, at_risk, now).listPlacementQueue()
+        placement = placeTasks(queue, slots)
+        missed = {entry.task for entry in placement.unplaced if entry.reason is Reason.MISSES_DEADLINE}
+        if missed <= at_risk:
+            return OrderedPlacement(placement=placement, at_risk=at_risk)
+        at_risk |= missed
+
+
+def sortIntoBuckets(tasks: Iterable[Task], at_risk: frozenset[TaskId], now: datetime) -> TasksByBucket:
+    """Sort tasks into the four shortest-first buckets.
+
+    A task goes to the first bucket that matches, in this order: unestimated, deadline at
+    risk, not yet doable, quickest. At risk comes before not yet doable, because the
+    deadline of a deferred task can still be missed.
+    """
+    risky, quickest, not_yet, unestimated = [], [], [], []
+    for task in tasks:
+        if task.estimate_minutes is None:
+            unestimated.append(task)
+        elif task.id in at_risk:
+            risky.append(task)
+        elif graph.notYetDoable(task, now):
+            not_yet.append(task)
+        else:
+            quickest.append(task)
+
+    return TasksByBucket(
+        at_risk=tuple(sorted(risky, key=lambda task: _computeSchedulingKey(task, TaskOrder.DEADLINE))),
+        quickest=tuple(sorted(quickest, key=lambda task: _computeSchedulingKey(task, TaskOrder.SHORTEST))),
+        not_yet=tuple(sorted(not_yet, key=lambda task: (task.not_before or now, task.id))),
+        unestimated=tuple(unestimated),
+    )
 
 
 ### vocabulary #########################################################################
 
 
-# a sort key stays a tuple: dataclasses do not order, and ordering is the whole point
+# dataclasses do not compare with <. The sort key stays a tuple
 _SchedulingKey = tuple[int, bool, date, int, datetime, TaskId]
 
 
 @dataclass(frozen=True)
 class _Fit:
-    blocks: list[PlanBlock] | None  # None: the task did not fit and consumed nothing
-    free_after: list[Slot]
+    blocks: tuple[PlanBlock, ...] | None  # None: the task did not fit and consumed nothing
+    free_after: tuple[Slot, ...]
